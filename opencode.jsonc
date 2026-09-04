@@ -1,0 +1,46 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+  "shell": "pwsh",
+  "instructions": [
+    "NEMOTRON_FINAL_REMEDIATION_PROMPT.md"
+  ],
+  "permission": {
+    "*": "allow",
+    "external_directory": "allow",
+    "doom_loop": "allow"
+  },
+  "provider": {
+    "openrouter": {
+      "models": {
+        "z-ai/glm-5.2:free": {
+          "name": "GLM 5.2 Free"
+        }
+      }
+    }
+  },
+  "agent": {
+    "nemotron-builder": {
+      "description": "Autonomous implementation agent supervised by the repository quality gate",
+      "mode": "primary",
+      "model": "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+      "prompt": "Work directly in the repository. Follow AGENTS.md and the remediation prompt. Implement and verify changes; use the quality-gate tool after coherent changes and never report completion until it exits 0.",
+      "permission": {
+        "*": "allow",
+        "external_directory": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "glm-benchmark": {
+      "description": "OpenRouter GLM 5.2 Free benchmark agent; leaves Nemotron as the default",
+      "mode": "primary",
+      "model": "openrouter/z-ai/glm-5.2:free",
+      "prompt": "Work directly in the repository. Follow AGENTS.md and the remediation prompt. Implement and verify changes; use the quality-gate tool after coherent changes and never report completion until it exits 0.",
+      "permission": {
+        "*": "allow",
+        "external_directory": "allow",
+        "doom_loop": "allow"
+      }
+    }
+  }
+}

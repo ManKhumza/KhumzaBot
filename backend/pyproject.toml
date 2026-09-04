@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noc-ai-backend"
+version = "1.0.1"
+description = "NOC AI Assistant Local Backend"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.109",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "sqlalchemy>=2.0",
+    "sqlite-vec>=0.1.6",
+    "python-multipart>=0.0.6",
+    "python-magic>=0.4.27; platform_system != 'Windows'",
+    "python-magic-bin>=0.4.14; platform_system == 'Windows'",
+    "passlib[argon2]>=1.7",
+    "httpx>=0.26",
+    "psutil>=5.9",
+    "gguf>=0.5",
+    "pypdf>=3.15",
+    "python-docx>=1.1",
+    "beautifulsoup4>=4.12",
+    "lxml>=4.9",
+    "markdown-it-py>=2.2",
+    "tiktoken>=0.6",
+    "numpy>=1.26",
+    "aiofiles>=23.0",
+    "PyMuPDF>=1.23.0",
+    "markdown>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.8",
+    "black>=23.0",
+]
+
+[tool.setuptools]
+packages = [
+    "backend", "backend.admin", "backend.api", "backend.audit", "backend.auth",
+    "backend.chat", "backend.db", "backend.documents", "backend.health",
+    "backend.inference", "backend.jobs", "backend.knowledge", "backend.models",
+    "backend.retrieval", "backend.security", "backend.system",
+]
+
+[tool.setuptools.package-dir]
+backend = "."
+
+[tool.pyinstaller]
+name = "nocai-backend"
+onefile = true
+console = false
+noconfirm = true
+clean = true
+log-level = "INFO"
+distpath = "../apps/desktop/electron/dist/backend"
+workpath = "../apps/desktop/electron/build/backend"
+specpath = "../apps/desktop/electron/build/backend"
+hidden-imports = [
+    "sqlite_vec",
+    "pypdf",
+    "docx",
+    "bs4",
+    "lxml",
+    "markdown_it",
+    "tiktoken",
+    "numpy",
+    "uvicorn.protocols.http.h11_impl",
+    "uvicorn.protocols.websockets.wsproto_impl",
+    "fitz",
+    "markdown",
+]
+collect-all = [
+    "sqlite_vec",
+]
+exclude-module = [
+    "tkinter",
+    "matplotlib",
+    "PIL",
+    "pytest",
+    "setuptools",
+    "pip",
+    "jupyter",
+    "notebook",
+    "IPython",
+]
+datas = [
+    { from = "../resources", to = "resources" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["../tests"]

@@ -1,0 +1,402 @@
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+from typing import Optional, List
+import uuid
+import shutil
+import aiofiles
+from pathlib import Path
+import logging
+import hashlib
+from datetime import datetime
+
+from backend.auth.dependencies import get_db, get_current_user, require_permission
+from backend.db.models import Collection, Document, CollectionPermission, IngestionJob, Model, User
+from backend.config import get_settings
+from backend.db.database import create_db_engine
+from backend.inference.lifecycle import ModelLifecycleManager
+from backend.retrieval.vector_store import VectorStore
+from backend.documents.service import DocumentService
+
+router = APIRouter(tags=["knowledge"])
+logger = logging.getLogger(__name__)
+
+class CollectionResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    ownerId: str
+    visibility: str
+    embeddingModelId: str
+    embeddingConfig: dict
+    chunkingConfig: dict
+    documentCount: int
+    chunkCount: int
+    totalSizeBytes: int
+    status: str
+    createdAt: str
+    updatedAt: str
+    reindexRequired: bool
+    reindexReason: Optional[str]
+    permission: Optional[str] = None
+
+class CreateCollectionRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+    embeddingModelId: str
+    embeddingConfig: dict = Field(default_factory=dict)
+    chunkingConfig: dict = Field(default_factory=dict)
+
+class DocumentPathsRequest(BaseModel):
+    filePaths: List[str]
+
+class DocumentResponse(BaseModel):
+    id: str
+    collectionId: str
+    filename: str
+    originalFilename: str
+    filepath: str
+    mimeType: str
+    sizeBytes: int
+    fileHash: str
+    pageCount: Optional[int]
+    language: Optional[str]
+    status: str
+    errorMessage: Optional[str]
+    chunkCount: int
+    embeddedModelId: Optional[str]
+    embeddedConfig: Optional[dict]
+    uploadedBy: str
+    uploadedAt: str
+    processedAt: Optional[str]
+    disabledAt: Optional[str]
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    collectionIds: Optional[List[str]] = None
+    topK: int = Field(10, ge=1, le=100)
+    enableHybrid: bool = True
+    hybridAlpha: float = Field(0.5, ge=0, le=1)
+    enableReranking: bool = False
+
+class SearchResultResponse(BaseModel):
+    chunkId: str
+    documentId: str
+    collectionId: str
+    content: str
+    score: float
+    pageStart: int
+    pageEnd: int
+    sectionTitle: Optional[str]
+    metadata: dict
+
+@router.get("/collections", response_model=List[CollectionResponse])
+async def list_collections(
+    current_user: User = Depends(require_permission("knowledge:list")),
+    db: Session = Depends(get_db)
+):
+    collections = db.query(Collection).filter(Collection.owner_id == current_user.id).all()
+    return [collection_to_response(c, "admin") for c in collections]
+
+@router.post("/collections", response_model=CollectionResponse)
+async def create_collection(
+    request: CreateCollectionRequest,
+    current_user: User = Depends(require_permission("knowledge:create")),
+    db: Session = Depends(get_db)
+):
+    settings = get_settings()
+    
+    embedding_config = {
+        "chunkSize": request.embeddingConfig.get("chunkSize", settings.default_chunk_size),
+        "chunkOverlap": request.embeddingConfig.get("chunkOverlap", settings.default_chunk_overlap),
+        "topK": request.embeddingConfig.get("topK", settings.default_top_k),
+        "hybridAlpha": request.embeddingConfig.get("hybridAlpha", settings.hybrid_alpha),
+        "enableReranking": request.embeddingConfig.get("enableReranking", settings.enable_reranking),
+    }
+    
+    chunking_config = {
+        "chunkSize": request.chunkingConfig.get("chunkSize", settings.default_chunk_size),
+        "chunkOverlap": request.chunkingConfig.get("chunkOverlap", settings.default_chunk_overlap),
+        "minChunkSize": request.chunkingConfig.get("minChunkSize", 50),
+        "respectBoundaries": request.chunkingConfig.get("respectBoundaries", True),
+    }
+    
+    collection = Collection(
+        id=str(uuid.uuid4()),
+        name=request.name,
+        description=request.description,
+        owner_id=current_user.id,
+        embedding_model_id=request.embeddingModelId,
+        embedding_config=embedding_config,
+        chunking_config=chunking_config,
+    )
+    db.add(collection)
+    db.commit()
+    db.refresh(collection)
+    
+    perm = CollectionPermission(
+        id=str(uuid.uuid4()),
+        collection_id=collection.id,
+        user_id=current_user.id,
+        permission="admin",
+        granted_by=current_user.id,
+    )
+    db.add(perm)
+    db.commit()
+    
+    return collection_to_response(collection, "admin")
+
+@router.delete("/collections/{collection_id}")
+async def delete_collection(
+    collection_id: str,
+    current_user: User = Depends(require_permission("knowledge:delete")),
+    db: Session = Depends(get_db)
+):
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(404, "Collection not found")
+    
+    perm = db.query(CollectionPermission).filter(
+        CollectionPermission.collection_id == collection_id,
+        CollectionPermission.user_id == current_user.id,
+        CollectionPermission.permission == "admin"
+    ).first()
+    
+    if not perm and current_user.id != collection.owner_id:
+        raise HTTPException(403, "Not authorized to delete this collection")
+    
+    db.delete(collection)
+    db.commit()
+    return {"success": True}
+
+@router.post("/collections/{collection_id}/documents", response_model=List[DocumentResponse])
+async def upload_documents(
+    collection_id: str,
+    request: DocumentPathsRequest,
+    http_request: Request,
+    current_user: User = Depends(require_permission("knowledge:write")),
+    db: Session = Depends(get_db)
+):
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(404, "Collection not found")
+    
+    perm = db.query(CollectionPermission).filter(
+        CollectionPermission.collection_id == collection_id,
+        CollectionPermission.user_id == current_user.id,
+        CollectionPermission.permission.in_(["write", "admin"])
+    ).first()
+    
+    if not perm and current_user.id != collection.owner_id:
+        raise HTTPException(403, "Not authorized to upload to this collection")
+    
+    settings = get_settings()
+    results = []
+    job_ids = []
+    
+    for file_path in request.filePaths:
+        source = Path(file_path).expanduser().resolve()
+        if not source.is_file():
+            logger.warning(f"Skipping missing file: {source}")
+            continue
+
+        ext = source.suffix.lower()
+        allowed_extensions = {'.txt', '.md', '.pdf', '.docx', '.csv', '.html', '.htm'}
+        if ext not in allowed_extensions:
+            logger.warning(f"Skipping file with unsupported extension: {source.name}")
+            continue
+        
+        collection_dir = Path(settings.knowledge_dir) / "collections" / collection_id / "source"
+        collection_dir.mkdir(parents=True, exist_ok=True)
+        
+        dest = collection_dir / source.name
+        counter = 1
+        while dest.exists():
+            dest = collection_dir / f"{source.stem}_{counter}{ext}"
+            counter += 1
+
+        async with aiofiles.open(source, "rb") as f:
+            content = await f.read()
+        async with aiofiles.open(dest, "wb") as f:
+            await f.write(content)
+        
+        file_hash = hashlib.sha256(content).hexdigest()
+        
+        existing = db.query(Document).filter(Document.file_hash == file_hash).first()
+        if existing:
+            dest.unlink(missing_ok=True)
+            logger.warning(f"Duplicate file: {source.name}")
+            continue
+        
+        mime_types = {
+            '.txt': 'text/plain', '.md': 'text/markdown', '.pdf': 'application/pdf',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.csv': 'text/csv', '.html': 'text/html', '.htm': 'text/html',
+        }
+        document = Document(
+            id=str(uuid.uuid4()),
+            collection_id=collection_id,
+            filename=dest.name,
+            original_filename=source.name,
+            filepath=str(dest.relative_to(settings.knowledge_dir)),
+            mime_type=mime_types[ext],
+            size_bytes=len(content),
+            file_hash=file_hash,
+            uploaded_by=current_user.id,
+            status="queued",
+        )
+        db.add(document)
+        job = IngestionJob(
+            id=str(uuid.uuid4()), document_id=document.id, collection_id=collection_id,
+            status="pending", priority=4, current_stage="queued", progress=0,
+            created_at=datetime.utcnow(),
+        )
+        db.add(job)
+        job_ids.append(job.id)
+        results.append(document)
+    
+    db.commit()
+    for doc in results:
+        db.refresh(doc)
+    for job_id in job_ids:
+        await http_request.app.state.ingestion.enqueue(job_id)
+    
+    return [document_to_response(d) for d in results]
+
+@router.get("/collections/{collection_id}/documents", response_model=List[DocumentResponse])
+async def list_documents(
+    collection_id: str,
+    current_user: User = Depends(require_permission("knowledge:list")),
+    db: Session = Depends(get_db)
+):
+    documents = db.query(Document).filter(Document.collection_id == collection_id).all()
+    return [document_to_response(d) for d in documents]
+
+@router.delete("/documents/{document_id}")
+async def delete_document(
+    document_id: str,
+    current_user: User = Depends(require_permission("knowledge:write")),
+    db: Session = Depends(get_db)
+):
+    document = db.query(Document).filter(Document.id == document_id).first()
+    if not document:
+        raise HTTPException(404, "Document not found")
+    
+    settings = get_settings()
+    perm = db.query(CollectionPermission).filter(
+        CollectionPermission.collection_id == document.collection_id,
+        CollectionPermission.user_id == current_user.id,
+        CollectionPermission.permission.in_(["write", "admin"])
+    ).first()
+    
+    if not perm and current_user.id != document.collection.owner_id:
+        raise HTTPException(403, "Not authorized to delete this document")
+    
+    try:
+        (Path(settings.knowledge_dir) / document.filepath).unlink(missing_ok=True)
+    except:
+        pass
+    
+    db.delete(document)
+    db.commit()
+    return {"success": True}
+
+@router.post("/documents/{document_id}/reprocess")
+async def reprocess_document(
+    document_id: str,
+    request: Request,
+    current_user: User = Depends(require_permission("knowledge:write")),
+    db: Session = Depends(get_db)
+):
+    document = db.query(Document).filter(Document.id == document_id).first()
+    if not document:
+        raise HTTPException(404, "Document not found")
+    
+    perm = db.query(CollectionPermission).filter(
+        CollectionPermission.collection_id == document.collection_id,
+        CollectionPermission.user_id == current_user.id,
+        CollectionPermission.permission.in_(["write", "admin"])
+    ).first()
+    
+    if not perm and current_user.id != document.collection.owner_id:
+        raise HTTPException(403, "Not authorized to reprocess this document")
+    
+    job_id = await request.app.state.ingestion.enqueue_document(document_id, priority=3)
+    return {"success": True, "jobId": job_id}
+
+@router.post("/search", response_model=List[SearchResultResponse])
+async def search_knowledge(
+    request: SearchRequest,
+    http_request: Request,
+    current_user: User = Depends(require_permission("knowledge:list")),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Collection).filter(Collection.owner_id == current_user.id)
+    if request.collectionIds:
+        query = query.filter(Collection.id.in_(request.collectionIds))
+    collections = query.all()
+    if not collections:
+        return []
+    model_ids = {c.embedding_model_id for c in collections}
+    if len(model_ids) != 1:
+        raise HTTPException(400, "Search collections must use the same embedding model")
+    model = db.get(Model, next(iter(model_ids)))
+    if model is None:
+        raise HTTPException(409, "The collection embedding model is unavailable")
+    manager = http_request.app.state.model_manager
+    provider = manager.get_embedding_provider()
+    if provider is None or manager.active_embedding_model_id != model.id:
+        provider = await manager.load_model(model, "embedding")
+    embedding = await provider.embed_single(request.query)
+    results = await http_request.app.state.ingestion.vector_store.search(
+        embedding, collection_ids=[c.id for c in collections], top_k=request.topK
+    )
+    return [SearchResultResponse(
+        chunkId=r.chunk_id, documentId=r.document_id, collectionId=r.collection_id,
+        content=r.content, score=r.score, pageStart=r.page_start,
+        pageEnd=r.page_end, sectionTitle=r.section_title, metadata=r.metadata,
+    ) for r in results]
+
+def collection_to_response(collection: Collection, permission: str) -> CollectionResponse:
+    return CollectionResponse(
+        id=collection.id,
+        name=collection.name,
+        description=collection.description,
+        ownerId=collection.owner_id,
+        visibility=collection.visibility,
+        embeddingModelId=collection.embedding_model_id,
+        embeddingConfig=collection.embedding_config or {},
+        chunkingConfig=collection.chunking_config or {},
+        documentCount=collection.document_count,
+        chunkCount=collection.chunk_count,
+        totalSizeBytes=collection.total_size_bytes,
+        status=collection.status,
+        createdAt=collection.created_at.isoformat() if collection.created_at else "",
+        updatedAt=collection.updated_at.isoformat() if collection.updated_at else "",
+        reindexRequired=collection.reindex_required,
+        reindexReason=collection.reindex_reason,
+        permission=permission,
+    )
+
+def document_to_response(doc: Document) -> DocumentResponse:
+    return DocumentResponse(
+        id=doc.id,
+        collectionId=doc.collection_id,
+        filename=doc.filename,
+        originalFilename=doc.original_filename,
+        filepath=doc.filepath,
+        mimeType=doc.mime_type,
+        sizeBytes=doc.size_bytes,
+        fileHash=doc.file_hash,
+        pageCount=doc.page_count,
+        language=doc.language,
+        status=doc.status,
+        errorMessage=doc.error_message,
+        chunkCount=doc.chunk_count,
+        embeddedModelId=doc.embedded_model_id,
+        embeddedConfig=doc.embedded_config,
+        uploadedBy=doc.uploaded_by,
+        uploadedAt=doc.uploaded_at.isoformat() if doc.uploaded_at else "",
+        processedAt=doc.processed_at.isoformat() if doc.processed_at else None,
+        disabledAt=doc.disabled_at.isoformat() if doc.disabled_at else None,
+    )

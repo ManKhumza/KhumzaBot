@@ -1,0 +1,35 @@
+fastapi>=0.109
+uvicorn[standard]>=0.27
+pydantic>=2.5
+pydantic-settings>=2.1
+sqlalchemy>=2.0
+sqlite-vec>=0.1.6
+python-multipart>=0.0.6
+passlib[argon2]>=1.7
+httpx>=0.26
+psutil>=5.9
+gguf>=0.5
+pypdf>=3.15
+python-docx>=1.1
+beautifulsoup4>=4.12
+lxml>=4.9
+markdown-it-py>=2.2
+tiktoken>=0.6
+numpy>=1.26
+aiofiles>=23.0
+PyMuPDF>=1.23.0
+markdown>=3.5
+
+[:platform_system != "Windows"]
+python-magic>=0.4.27
+
+[:platform_system == "Windows"]
+python-magic-bin>=0.4.14
+
+[dev]
+pytest>=7.4
+pytest-asyncio>=0.23
+pytest-cov>=4.1
+ruff>=0.1
+mypy>=1.8
+black>=23.0

@@ -1,0 +1,172 @@
+# NOC AI Assistant Backend
+
+FastAPI-based local backend for NOC AI Assistant, packaged as a standalone executable via PyInstaller.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      FastAPI Backend                         │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐      │
+│  │  Auth    │ │  Chat    │ │ Knowledge│ │  Models    │      │
+│  │  /RBAC   │ │  /Queue  │ │  /RAG    │ │  /LLM      │      │
+│  └──────────┘ └──────────┘ └──────────┘ └────────────┘      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐                      │
+│  │  Jobs    │ │  Audit   │ │  Health  │                      │
+│  └──────────┘ └──────────┘ └──────────┘                      │
+└─────────────────────────────────────────────────────────────┘
+         │              │              │
+         ▼              ▼              ▼
+  ┌────────────┐ ┌────────────┐ ┌────────────┐
+  │   SQLite   │ │  Vector    │ │ llama.cpp  │
+  │  (WAL)     │ │ (sqlite-vec)           │
+  └────────────┘ └────────────┘ └────────────┘
+```
+
+## Features
+
+- **Authentication**: Argon2id password hashing, session tokens, RBAC
+- **Chat**: Streaming completions, conversation management, citations
+- **Models**: GGUF model registry, hardware compatibility, lifecycle management
+- **Knowledge**: Document collections, ingestion pipeline, hybrid search (vector + FTS5)
+- **Retrieval**: Permission-aware RAG with Reciprocal Rank Fusion
+- **Admin**: User management, audit logging, job monitoring, health checks
+- **Security**: Loopback-only binding, session tokens, constant-time comparison
+
+## Development Setup
+
+```bash
+# Create virtual environment
+python -m venv .venv
+.venv\Scripts\activate
+
+# Install dependencies
+pip install -e ".[dev]"
+
+# Run backend
+python main.py --port 8080 --token <session-token> --data-dir <data-dir>
+```
+
+## Building Executable
+
+```bash
+# Install PyInstaller
+pip install pyinstaller
+
+# Build
+pyinstaller nocai-backend.spec --clean --noconfirm
+
+# Output: dist/nocai-backend.exe
+```
+
+## Configuration
+
+Environment variables:
+- `NOC_AI_SESSION_TOKEN` - Session token for auth (set by Electron)
+- `NOC_AI_DATA_DIR` - Data directory path
+- `NOC_AI_MODELS_DIR` - Models directory
+- `NOC_AI_KNOWLEDGE_DIR` - Knowledge base directory
+- `NOC_AI_LLAMA_SERVER` - Path to llama-server binary
+- `NOC_AI_LOG_LEVEL` - Log level (DEBUG, INFO, WARNING, ERROR)
+
+## API Endpoints
+
+### Auth
+- `POST /api/v1/auth/login` - Login
+- `POST /api/v1/auth/logout` - Logout
+- `GET /api/v1/auth/session` - Get current session
+- `POST /api/v1/auth/change-password` - Change password
+
+### Chat
+- `GET /api/v1/chat/conversations` - List conversations
+- `POST /api/v1/chat/conversations` - Create conversation
+- `GET /api/v1/chat/conversations/{id}` - Get conversation
+- `DELETE /api/v1/chat/conversations/{id}` - Delete conversation
+- `GET /api/v1/chat/conversations/{id}/messages` - Get messages
+- `POST /api/v1/chat/completions` - Chat completion (streaming)
+
+### Models
+- `GET /api/v1/models` - List models
+- `POST /api/v1/models/scan` - Scan directory for GGUF files
+- `POST /api/v1/models/import` - Import model
+- `POST /api/v1/models/{id}/activate` - Activate model
+- `POST /api/v1/models/{id}/deactivate` - Deactivate model
+- `DELETE /api/v1/models/{id}` - Delete model
+- `GET /api/v1/models/hardware` - Get hardware info
+- `POST /api/v1/models/estimate` - Estimate model requirements
+
+### Knowledge
+- `GET /api/v1/knowledge/collections` - List collections
+- `POST /api/v1/knowledge/collections` - Create collection
+- `DELETE /api/v1/knowledge/collections/{id}` - Delete collection
+- `POST /api/v1/knowledge/collections/{id}/documents` - Upload documents
+- `GET /api/v1/knowledge/collections/{id}/documents` - List documents
+- `DELETE /api/v1/knowledge/documents/{id}` - Delete document
+- `POST /api/v1/knowledge/search` - Search knowledge
+
+### Admin
+- `GET /api/v1/admin/users` - List users
+- `POST /api/v1/admin/users` - Create user
+- `PATCH /api/v1/admin/users/{id}` - Update user
+- `DELETE /api/v1/admin/users/{id}` - Delete user
+- `GET /api/v1/admin/roles` - List roles
+- `GET /api/v1/admin/audit` - Get audit log
+- `GET /api/v1/admin/jobs` - Get ingestion jobs
+- `GET /api/v1/admin/health` - Get system health
+
+### Health (no auth required)
+- `GET /health` - Basic health
+- `GET /health/ready` - Readiness check
+- `GET /health/live` - Liveness check
+
+## Database Schema
+
+Key tables:
+- `users` - User accounts with Argon2id hashes
+- `sessions` - Active sessions with token hashes
+- `conversations` - Chat conversations
+- `messages` - Chat messages with citations
+- `models` - GGUF model registry
+- `model_configs` - Runtime configuration per model
+- `collections` - Knowledge collections
+- `collection_permissions` - ACL for collections
+- `documents` - Uploaded documents with processing status
+- `chunks` - Document chunks with content and metadata
+- `chunks_vec` - sqlite-vec virtual table for embeddings
+- `chunks_fts` - FTS5 virtual table for keyword search
+- `ingestion_jobs` - Background processing jobs
+- `audit_log` - Security audit trail
+- `settings` - User/global settings
+- `schema_version` - Migration tracking
+
+## Inference Architecture
+
+- **llama.cpp** via `llama-server` subprocess
+- Dynamic port allocation per model
+- Separate processes for chat and embedding models
+- Priority-based queue: chat > retrieval > embedding > ingestion > maintenance
+- Model lifecycle: NOT_LOADED → STARTING → READY → BUSY → STOPPING → NOT_LOADED
+
+## Security
+
+- Backend binds to `127.0.0.1` only
+- Random port per session
+- Session token required on all endpoints (except health)
+- Constant-time token comparison
+- Argon2id with memory_cost=64MB, time_cost=3, parallelism=4
+- Permission checks at API layer + UI gating
+- ACL filtering BEFORE vector search (not post-filter)
+- Path traversal protection
+- File type validation (extension + MIME)
+- No shell=True in subprocesses
+- CREATE_NO_WINDOW on Windows
+
+## Testing
+
+```bash
+# Run tests
+pytest tests/ -v
+
+# Run with coverage
+pytest tests/ --cov=backend --cov-report=html
+```

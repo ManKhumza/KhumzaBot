@@ -1,0 +1,31 @@
+NOC AI Assistant - End User License Agreement
+
+Copyright (c) 2024 NOC AI. All rights reserved.
+
+This software is proprietary and confidential. Use is subject to license terms.
+
+1. GRANT OF LICENSE
+Subject to the terms of this Agreement, NOC AI grants you a non-exclusive, non-transferable license to use the Software on a single Windows workstation.
+
+2. RESTRICTIONS
+You may not:
+- Reverse engineer, decompile, or disassemble the Software
+- Modify, adapt, or create derivative works
+- Distribute, sublicense, or transfer the Software
+- Remove any proprietary notices
+- Use the Software for any unlawful purpose
+
+3. DATA PRIVACY
+The Software operates entirely offline. No data is transmitted to external servers. All models, documents, and conversations remain on your local machine.
+
+4. NO WARRANTY
+The Software is provided "AS IS" without warranty of any kind.
+
+5. LIMITATION OF LIABILITY
+In no event shall NOC AI be liable for any damages arising from use of the Software.
+
+6. TERMINATION
+This Agreement terminates automatically if you breach any term.
+
+7. GOVERNING LAW
+This Agreement is governed by applicable law.

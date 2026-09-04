@@ -1,0 +1,50 @@
+appId: com.nocai.assistant
+productName: NOC AI Assistant
+copyright: "Copyright (c) 2024 NOC AI"
+directories:
+  output: release
+  buildResources: ../../../resources
+files:
+  - from: .
+    filter:
+      - "dist/**/*"
+      - "!**/*.map"
+      - "!**/*.d.ts"
+      - "!**/*.d.ts.map"
+asar: true
+extraResources:
+  - from: ../../../runtimes/python
+    to: python
+    filter: ["**/*"]
+  - from: ../../../runtimes/llama
+    to: llama
+    filter: ["*.exe", "*.dll", "*.so"]
+  - from: ../../../resources/models
+    to: models
+    filter: ["*.gguf", "README.md"]
+win:
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: ../../../resources/icons/icon.ico
+  verifyUpdateCodeSignature: false
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: NOC AI Assistant
+  uninstallDisplayName: NOC AI Assistant
+  license: ../../../resources/license.txt
+  installerIcon: ../../../resources/icons/installer.ico
+  uninstallerIcon: ../../../resources/icons/uninstaller.ico
+  installerHeader: ../../../resources/icons/header.bmp
+  artifactName: "NOC-AI-Assistant-Setup-${version}.exe"
+portable:
+  artifactName: "NOC-AI-Assistant-Portable-${version}.exe"
