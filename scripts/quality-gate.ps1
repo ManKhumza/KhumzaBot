@@ -79,6 +79,7 @@ function Invoke-GateStep {
 }
 
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$PowerShellExecutable = (Get-Process -Id $PID).Path
 $EmbeddingModel = Join-Path $ProjectRoot "resources\models\bge-small-en-v1.5-q8_0.gguf"
 $LlamaServer = Join-Path $ProjectRoot "runtimes\llama\llama-server.exe"
 $ExpectedEmbeddingHash = "F046DB1DC724CF4F6F0A0C5917E922823B73EB1D27B8F9A9C2797F7866974804"
@@ -121,7 +122,7 @@ if (Get-Command "npm.cmd" -ErrorAction SilentlyContinue) {
     Invoke-GateStep "Electron TypeScript build" "npm.cmd" @("run", "build") (Join-Path $ProjectRoot "apps\desktop\electron")
 }
 if ($Package) {
-    Invoke-GateStep "Clean package and release verification" "pwsh.exe" @("-NoProfile", "-File", (Join-Path $PSScriptRoot "build-all.ps1"))
+    Invoke-GateStep "Clean package and release verification" $PowerShellExecutable @("-NoProfile", "-File", (Join-Path $PSScriptRoot "build-all.ps1"))
 }
 
 $Passed = ($script:Results.Count -gt 0 -and @($script:Results | Where-Object { -not $_.passed }).Count -eq 0)

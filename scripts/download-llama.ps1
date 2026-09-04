@@ -29,7 +29,7 @@ $Complete = (Test-Path $VersionFile) -and ((Get-Content $VersionFile -Raw).Trim(
 foreach ($File in $RequiredFiles) { $Complete = $Complete -and (Test-Path (Join-Path $OutputPath $File)) }
 if ($Complete) {
     Write-Host "llama.cpp $($Release.tag_name) is already installed." -ForegroundColor Green
-    exit 0
+    return
 }
 
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null

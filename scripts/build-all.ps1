@@ -27,7 +27,6 @@ Write-Host "Building NOC AI Assistant $Version" -ForegroundColor Cyan
 
 if (-not $SkipRuntime) {
     & (Join-Path $PSScriptRoot "download-llama.ps1")
-    if ($LASTEXITCODE -ne 0) { throw "llama.cpp runtime setup failed." }
 }
 
 if (-not $SkipBackend) {
@@ -36,7 +35,6 @@ if (-not $SkipBackend) {
     Invoke-Checked $Python @("-m", "pip", "install", "-e", "$BackendDir[dev]")
     Invoke-Checked $Python @("-m", "pytest", "-q", (Join-Path $ProjectRoot "tests"))
     & (Join-Path $PSScriptRoot "build-python-runtime.ps1")
-    if ($LASTEXITCODE -ne 0) { throw "Portable Python backend runtime setup failed." }
 }
 
 if (-not $SkipFrontend) {
@@ -57,10 +55,8 @@ try {
         if ($Sign) {
             Invoke-Checked "npx.cmd" @("electron-builder", "--win", "--x64", "--dir", "--config", "builder.yaml")
             & (Join-Path $PSScriptRoot "sign-windows.ps1") -Path (Join-Path $ReleaseDir "win-unpacked")
-            if ($LASTEXITCODE -ne 0) { throw "Signing the unpacked application failed." }
             Invoke-Checked "npx.cmd" @("electron-builder", "--win", "nsis", "portable", "--x64", "--publish=never", "--prepackaged", (Join-Path $ReleaseDir "win-unpacked"), "--config", "builder.yaml")
             & (Join-Path $PSScriptRoot "sign-windows.ps1") -Path (Join-Path $ReleaseDir "NOC-AI-Assistant-Setup-$Version.exe"), (Join-Path $ReleaseDir "NOC-AI-Assistant-Portable-$Version.exe")
-            if ($LASTEXITCODE -ne 0) { throw "Signing release artifacts failed." }
         } else {
             Invoke-Checked "npx.cmd" @("electron-builder", "--win", "--x64", "--publish=never", "--config", "builder.yaml")
         }

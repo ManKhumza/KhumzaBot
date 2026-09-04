@@ -29,3 +29,26 @@ def test_package_integrity_bundled_model_hash(tmp_path):
 def test_package_integrity_no_stale_artifacts(tmp_path):
     """Package integrity: no mixed-generation artifacts in release."""
     # All release outputs from same source/version/build run
+
+
+def test_package_gate_reuses_current_powershell():
+    """Package gate works under both Windows PowerShell and PowerShell 7."""
+    project_root = Path(__file__).resolve().parents[1]
+    gate = (project_root / "scripts" / "quality-gate.ps1").read_text(encoding="utf-8")
+
+    assert "$PowerShellExecutable = (Get-Process -Id $PID).Path" in gate
+    assert '"Clean package and release verification" $PowerShellExecutable' in gate
+    assert '"Clean package and release verification" "pwsh.exe"' not in gate
+
+
+def test_build_scripts_do_not_use_stale_native_exit_codes():
+    """PowerShell child scripts propagate exceptions without stale LASTEXITCODE checks."""
+    project_root = Path(__file__).resolve().parents[1]
+    build = (project_root / "scripts" / "build-all.ps1").read_text(encoding="utf-8")
+    downloader = (project_root / "scripts" / "download-llama.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'throw "llama.cpp runtime setup failed."' not in build
+    assert 'throw "Portable Python backend runtime setup failed."' not in build
+    assert "exit 0" not in downloader
