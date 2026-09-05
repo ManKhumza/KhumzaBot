@@ -1,6 +1,6 @@
 {
   "name": "noc-ai-electron",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Private local AI assistant for Windows",
   "author": "NOC AI",
   "private": true,

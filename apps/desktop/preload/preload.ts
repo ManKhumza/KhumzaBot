@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('nocai', {
   // Auth
   auth: {
+    getStatus: () => ipcRenderer.invoke('nocai:auth:getStatus'),
     login: (credentials: { username: string; password: string }) => 
       ipcRenderer.invoke('nocai:auth:login', credentials),
     logout: () => ipcRenderer.invoke('nocai:auth:logout'),
@@ -18,6 +19,8 @@ contextBridge.exposeInMainWorld('nocai', {
     createConversation: (title?: string) => ipcRenderer.invoke('nocai:chat:createConversation', title),
     deleteConversation: (id: string) => ipcRenderer.invoke('nocai:chat:deleteConversation', id),
     renameConversation: (id: string, title: string) => ipcRenderer.invoke('nocai:chat:renameConversation', { id, title }),
+    updateConversation: (id: string, updates: Record<string, unknown>) =>
+      ipcRenderer.invoke('nocai:chat:updateConversation', { id, updates }),
     getMessages: (conversationId: string, limit?: number, offset?: number) => 
       ipcRenderer.invoke('nocai:chat:getMessages', { conversationId, limit, offset }),
     sendMessage: (request: any) => ipcRenderer.invoke('nocai:chat:sendMessage', request),
@@ -41,13 +44,9 @@ contextBridge.exposeInMainWorld('nocai', {
     listCollections: () => ipcRenderer.invoke('nocai:knowledge:listCollections'),
     createCollection: (req: any) => ipcRenderer.invoke('nocai:knowledge:createCollection', req),
     deleteCollection: (id: string) => ipcRenderer.invoke('nocai:knowledge:deleteCollection', id),
-    uploadDocuments: (collectionId: string, files: File[]) => {
-      // Files need special handling - return file paths for now
-      return ipcRenderer.invoke('nocai:knowledge:uploadDocuments', { 
-        collectionId, 
-        files: Array.from(files).map(f => f.path) 
-      });
-    },
+    selectDocuments: () => ipcRenderer.invoke('nocai:knowledge:selectDocuments'),
+    uploadDocuments: (collectionId: string, filePaths: string[]) =>
+      ipcRenderer.invoke('nocai:knowledge:uploadDocuments', { collectionId, filePaths }),
     listDocuments: (collectionId: string) => ipcRenderer.invoke('nocai:knowledge:listDocuments', collectionId),
     deleteDocument: (id: string) => ipcRenderer.invoke('nocai:knowledge:deleteDocument', id),
     reprocessDocument: (id: string) => ipcRenderer.invoke('nocai:knowledge:reprocessDocument', id),

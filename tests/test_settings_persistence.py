@@ -56,8 +56,8 @@ def test_settings_persistence_survives_restart(tmp_path, monkeypatch):
     create_db_engine.cache_clear()
 
 
-def test_settings_validation_before_apply(tmp_path, monkeypatch):
-    """Settings: values validated before applying to prevent arbitrary paths."""
+def test_settings_api_round_trip(tmp_path, monkeypatch):
+    """Settings: the renderer route persists and returns user-visible values."""
     data_dir = tmp_path / "data"
     monkeypatch.setenv("NOC_AI_DATA_DIR", str(data_dir))
     monkeypatch.setenv("NOC_AI_MODELS_DIR", str(data_dir / "models"))
@@ -88,8 +88,28 @@ def test_settings_validation_before_apply(tmp_path, monkeypatch):
             "Authorization": f"Bearer {login.json()['token']}",
         }
         
-        # Try to set invalid path - should be rejected
-        # This tests the validation logic in settings endpoint
+        initial = client.get("/api/v1/settings", headers=headers)
+        assert initial.status_code == 200
+        assert initial.json()["appearance"]["compactMode"] is False
+
+        updated = client.patch(
+            "/api/v1/settings",
+            json={"appearance": {"compactMode": True}},
+            headers=headers,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["appearance"]["compactMode"] is True
+
+        persisted = client.get("/api/v1/settings", headers=headers)
+        assert persisted.status_code == 200
+        assert persisted.json()["appearance"]["compactMode"] is True
+
+        invalid = client.patch(
+            "/api/v1/settings",
+            json={"knowledge": {"defaultChunkSize": 32, "unexpected": True}},
+            headers=headers,
+        )
+        assert invalid.status_code == 422
 
     get_settings.cache_clear()
     create_db_engine.cache_clear()

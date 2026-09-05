@@ -123,6 +123,8 @@ def require_permission(permission: Permission):
     async def _require_permission(
         current_user: Annotated[User, Depends(get_current_user)]
     ) -> User:
+        if current_user.must_change_password:
+            raise HTTPException(403, "Password change required")
         if not check_permission(current_user, permission):
             from backend.audit.service import audit_log
             audit_log("auth.permission_denied", {

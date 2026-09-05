@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { useCallback, useEffect, useState } from 'react';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '@/stores/authStore';
 import { nocaiAPI } from '@/utils/api';
 import { Layout } from '@/components/layout/Layout';
@@ -16,8 +16,9 @@ import { NotFound } from '@/pages/NotFound';
 import { LoadingScreen } from '@/components/common/LoadingScreen';
 import { BackendStatusBanner } from '@/components/common/BackendStatusBanner';
 
-const ProtectedRoute = ({ children, requiredPermission }: { children: React.ReactNode; requiredPermission?: string }) => {
-  const { isAuthenticated, isLoading } = useAuthStore();
+const ProtectedRoute = ({ children, administratorOnly = false }: { children: React.ReactNode; administratorOnly?: boolean }) => {
+  const { isAuthenticated, isLoading, user } = useAuthStore();
+  const location = useLocation();
   
   if (isLoading) {
     return <LoadingScreen message="Checking authentication..." />;
@@ -26,8 +27,15 @@ const ProtectedRoute = ({ children, requiredPermission }: { children: React.Reac
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
   }
-  
-  // TODO: Check specific permission if required
+
+  if (user?.mustChangePassword && location.pathname !== '/settings') {
+    return <Navigate to="/settings?password=required" replace />;
+  }
+
+  if (administratorOnly && !user?.roles.includes('administrator')) {
+    return <Navigate to="/" replace />;
+  }
+
   return <>{children}</>;
 };
 
@@ -46,34 +54,41 @@ const PublicRoute = ({ children }: { children: React.ReactNode }) => {
 };
 
 function AppContent() {
-  const { checkSession } = useAuthStore();
   const [backendReady, setBackendReady] = useState(false);
   const [backendError, setBackendError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const checkBackend = async () => {
-      try {
-        const health = await nocaiAPI.system.getHealth();
-        setBackendReady(health.status === 'ready');
-        setBackendError(null);
-      } catch (error: any) {
-        setBackendReady(false);
-        setBackendError(error.message || 'Backend unavailable');
-      }
-    };
-
-    checkBackend();
-    const interval = setInterval(checkBackend, 30000);
-    return () => clearInterval(interval);
+  const checkBackend = useCallback(async () => {
+    try {
+      const health = await nocaiAPI.system.getHealth();
+      setBackendReady(health.status === 'ready');
+      setBackendError(health.status === 'ready' ? null : 'Local services are still starting');
+    } catch (error) {
+      setBackendReady(false);
+      setBackendError(error instanceof Error ? error.message : 'Backend unavailable');
+    }
   }, []);
 
   useEffect(() => {
-    checkSession();
-  }, [checkSession]);
+    checkBackend();
+    const interval = setInterval(checkBackend, 30000);
+    return () => clearInterval(interval);
+  }, [checkBackend]);
+
+  useEffect(() => {
+    if (!window.nocai) return;
+    return window.nocai.onBackendStatusChange((status) => {
+      if (status.status === 'ready') {
+        checkBackend();
+      } else if (status.status === 'error') {
+        setBackendReady(false);
+        setBackendError(status.error || 'Backend unavailable');
+      }
+    });
+  }, [checkBackend]);
 
   return (
     <>
-      <BackendStatusBanner isReady={backendReady} error={backendError} />
+      <BackendStatusBanner isReady={backendReady} error={backendError} onRetry={checkBackend} />
       <Routes>
         <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
         <Route
@@ -90,7 +105,7 @@ function AppContent() {
           <Route path="/knowledge" element={<Knowledge />} />
           <Route path="/search" element={<Search />} />
           <Route path="/settings" element={<Settings />} />
-          <Route path="/admin/*" element={<Admin />} />
+          <Route path="/admin/*" element={<ProtectedRoute administratorOnly><Admin /></ProtectedRoute>} />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>

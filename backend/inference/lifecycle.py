@@ -4,6 +4,7 @@ import httpx
 import os
 import logging
 import secrets
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
@@ -12,6 +13,10 @@ from backend.config import Settings
 from backend.db.models import Model
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingInputTooLong(RuntimeError):
+    pass
 
 class ModelStatus(str):
     NOT_LOADED = "not_loaded"
@@ -33,18 +38,83 @@ class ModelProvider:
     api_key: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
     async def embed_single(self, text: str) -> list[float]:
+        embeddings = await self.embed_batch([text])
+        return embeddings[0]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        try:
+            return await self._request_embeddings(texts)
+        except EmbeddingInputTooLong:
+            logger.warning(
+                "Embedding batch exceeded the model token window; splitting %d inputs",
+                len(texts),
+            )
+            return list(await asyncio.gather(*(self._embed_with_splitting(text) for text in texts)))
+
+    async def _request_embeddings(self, texts: list[str]) -> list[list[float]]:
         if not self.client:
             raise RuntimeError("Embedding runtime is not ready")
         response = await self.client.post(
             "/v1/embeddings",
-            json={"input": text},
+            json={"input": texts},
         )
+        if response.status_code >= 400:
+            detail = response.text.lower()
+            if any(fragment in detail for fragment in (
+                "too large to process",
+                "physical batch size",
+                "context size",
+                "context window",
+            )):
+                raise EmbeddingInputTooLong(response.text)
         response.raise_for_status()
         payload = response.json()
         data = payload.get("data") or []
-        if not data or not data[0].get("embedding"):
-            raise RuntimeError("Embedding runtime returned no vector")
-        return data[0]["embedding"]
+        ordered = sorted(data, key=lambda item: item.get("index", 0))
+        embeddings = [item.get("embedding") for item in ordered]
+        if len(embeddings) != len(texts) or any(not vector for vector in embeddings):
+            raise RuntimeError(
+                f"Embedding runtime returned {len(embeddings)} vectors for {len(texts)} inputs"
+            )
+        return embeddings
+
+    async def _embed_with_splitting(self, text: str, depth: int = 0) -> list[float]:
+        try:
+            return (await self._request_embeddings([text]))[0]
+        except EmbeddingInputTooLong:
+            if depth >= 12 or len(text) < 2:
+                raise RuntimeError("A document chunk could not fit in the embedding model context")
+
+        midpoint = len(text) // 2
+        lower_bound = max(1, len(text) // 4)
+        upper_bound = min(len(text) - 1, len(text) * 3 // 4)
+        left_space = text.rfind(" ", lower_bound, midpoint + 1)
+        right_space = text.find(" ", midpoint, upper_bound)
+        candidates = [index for index in (left_space, right_space) if index > 0]
+        split_at = min(candidates, key=lambda index: abs(index - midpoint)) if candidates else midpoint
+        left = text[:split_at].strip()
+        right = text[split_at:].strip()
+        if not left or not right:
+            left, right = text[:midpoint], text[midpoint:]
+
+        left_vector = await self._embed_with_splitting(left, depth + 1)
+        right_vector = await self._embed_with_splitting(right, depth + 1)
+        if len(left_vector) != len(right_vector):
+            raise RuntimeError("Embedding runtime returned inconsistent vector dimensions")
+
+        left_weight = max(1, len(left))
+        right_weight = max(1, len(right))
+        total_weight = left_weight + right_weight
+        combined = [
+            (left_value * left_weight + right_value * right_weight) / total_weight
+            for left_value, right_value in zip(left_vector, right_vector)
+        ]
+        norm = math.sqrt(sum(value * value for value in combined))
+        if not math.isfinite(norm) or norm == 0:
+            raise RuntimeError("Embedding runtime returned an empty or non-finite vector")
+        return [value / norm for value in combined]
 
 class ModelLifecycleManager:
     def __init__(self, settings: Settings):

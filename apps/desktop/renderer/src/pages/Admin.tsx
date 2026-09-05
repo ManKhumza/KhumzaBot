@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { useAuthStore } from '@/stores/authStore';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { nocaiAPI } from '@/utils/api';
+import { parseApiTimestamp } from '@/utils/date';
 import { Button } from '@/components/common/Button';
 import { Input } from '@/components/common/Input';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/common/Card';
@@ -8,12 +9,21 @@ import { Badge } from '@/components/common/Badge';
 import { Dialog, AlertDialog } from '@/components/common/Dialog';
 import { Plus, Trash2, Users, Shield, Activity, HardDrive, Monitor, Loader2, Search, Edit2, Key } from 'lucide-react';
 import { clsx } from 'clsx';
-import { useTabs } from '@/hooks/useTabs';
 import type { User, Role, AuditEntry, HealthStatus, JobProgress } from '@/types';
 
+type AdminTab = 'users' | 'roles' | 'audit' | 'jobs' | 'health';
+
+const adminTabFromPath = (pathname: string): AdminTab => {
+  const candidate = pathname.split('/')[2];
+  return ['users', 'roles', 'audit', 'jobs', 'health'].includes(candidate)
+    ? candidate as AdminTab
+    : 'users';
+};
+
 export const Admin = () => {
-  const { user } = useAuthStore();
-  const [activeTab, setActiveTab] = useState<'users' | 'roles' | 'audit' | 'jobs' | 'health'>('users');
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [activeTab, setActiveTab] = useState<AdminTab>(() => adminTabFromPath(location.pathname));
   
   // Users
   const [users, setUsers] = useState<User[]>([]);
@@ -104,12 +114,16 @@ export const Admin = () => {
   };
 
   useEffect(() => {
-    loadUsers();
-    loadRoles();
-    loadAudit();
-    loadJobs();
-    loadHealth();
-  }, []);
+    setActiveTab(adminTabFromPath(location.pathname));
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (activeTab === 'users') loadUsers();
+    if (activeTab === 'roles') loadRoles();
+    if (activeTab === 'audit') loadAudit();
+    if (activeTab === 'jobs') loadJobs();
+    if (activeTab === 'health') loadHealth();
+  }, [activeTab]);
 
   const handleCreateUser = async () => {
     if (!newUser.username || !newUser.password) return;
@@ -177,7 +191,7 @@ export const Admin = () => {
                 key={tab.id}
                 role="tab"
                 aria-selected={activeTab === tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
+                onClick={() => navigate(`/admin/${tab.id}`)}
                 className={clsx(
                   'flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors',
                   activeTab === tab.id
@@ -405,7 +419,7 @@ const UsersTab = ({
                   </Badge>
                 </td>
                 <td className="px-4 py-3 text-sm text-muted-foreground">
-                  {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleDateString() : 'Never'}
+                  {u.lastLoginAt ? parseApiTimestamp(u.lastLoginAt).toLocaleDateString() : 'Never'}
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-1">
@@ -494,7 +508,7 @@ const AuditTab = ({ auditLogs, loading, onRefresh, filters, setFilters }: any) =
           <tbody className="divide-y divide-border">
             {auditLogs.map((log: AuditEntry) => (
               <tr key={log.id} className="hover:bg-accent/50">
-                <td className="px-4 py-3 text-sm text-muted-foreground">{new Date(log.timestamp).toLocaleString()}</td>
+                <td className="px-4 py-3 text-sm text-muted-foreground">{parseApiTimestamp(log.timestamp).toLocaleString()}</td>
                 <td className="px-4 py-3 text-sm">{log.actorName || log.actorId || 'System'}</td>
                 <td className="px-4 py-3 text-sm font-mono text-muted-foreground">{log.action}</td>
                 <td className="px-4 py-3 text-sm">
@@ -562,10 +576,10 @@ const JobsTab = ({ jobs, loading, onRefresh, filters, setFilters }: any) => (
                 <td className="px-4 py-3 text-sm text-muted-foreground">{job.currentStage || '-'}</td>
                 <td className="px-4 py-3">
                   <div className="w-32 h-2 bg-muted rounded-full overflow-hidden">
-                    <div className="h-full bg-primary" style={{ width: `${job.progress * 100}%` }} />
+                    <div className="h-full bg-primary" style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }} />
                   </div>
                 </td>
-                <td className="px-4 py-3 text-sm text-muted-foreground">{new Date(job.createdAt).toLocaleString()}</td>
+                <td className="px-4 py-3 text-sm text-muted-foreground">{parseApiTimestamp(job.createdAt).toLocaleString()}</td>
               </tr>
             ))}
           </tbody>

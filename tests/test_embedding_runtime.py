@@ -65,3 +65,81 @@ def test_embedding_dimension_validation(tmp_path):
         store = VectorStore(db_path, 384)
         # Verify dimension is stored
         assert store.embedding_dim == 384
+
+
+def test_embedding_runtime_batches_and_orders_vectors():
+    """Embedding batches retain input order even if the runtime response is unordered."""
+    from backend.inference.lifecycle import ModelProvider
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": 1, "embedding": [2.0, 2.0]},
+                    {"index": 0, "embedding": [1.0, 1.0]},
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self):
+            self.payload = None
+
+        async def post(self, _path, json):
+            self.payload = json
+            return FakeResponse()
+
+    client = FakeClient()
+    provider = ModelProvider(model_id="embedding", role="embedding", client=client)
+    vectors = asyncio.run(provider.embed_batch(["first", "second"]))
+
+    assert client.payload == {"input": ["first", "second"]}
+    assert vectors == [[1.0, 1.0], [2.0, 2.0]]
+
+
+def test_embedding_runtime_splits_oversized_inputs():
+    """An oversized model-token sequence is embedded in pieces and recombined."""
+    from backend.inference.lifecycle import ModelProvider
+
+    class FakeResponse:
+        def __init__(self, texts):
+            self.status_code = 500 if any(len(text) > 12 for text in texts) else 200
+            self.text = (
+                "input is too large to process; increase the physical batch size"
+                if self.status_code >= 400 else ""
+            )
+            self._texts = texts
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise AssertionError("Oversized responses should be handled before raise_for_status")
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": index, "embedding": [1.0, float(len(text))]}
+                    for index, text in enumerate(self._texts)
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self):
+            self.requests = []
+
+        async def post(self, _path, json):
+            self.requests.append(json["input"])
+            return FakeResponse(json["input"])
+
+    client = FakeClient()
+    provider = ModelProvider(model_id="embedding", role="embedding", client=client)
+    vectors = asyncio.run(provider.embed_batch(["short", "this input is much too long for one request"]))
+
+    assert len(vectors) == 2
+    assert all(len(vector) == 2 for vector in vectors)
+    assert abs(sum(value * value for value in vectors[1]) - 1.0) < 1e-6
+    assert any(len(request) == 1 for request in client.requests)

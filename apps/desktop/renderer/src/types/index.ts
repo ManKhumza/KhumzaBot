@@ -101,6 +101,14 @@ export interface Document {
   uploadedAt: string;
   processedAt: string | null;
   disabledAt: string | null;
+  ingestionStage: string | null;
+  ingestionProgress: number | null;
+}
+
+export interface SelectedDocumentFile {
+  path: string;
+  name: string;
+  size: number;
 }
 
 export interface Conversation {
@@ -115,6 +123,15 @@ export interface Conversation {
   isArchived: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ConversationUpdate {
+  title?: string;
+  modelId?: string | null;
+  collectionId?: string | null;
+  systemPrompt?: string | null;
+  temperature?: number;
+  maxTokens?: number;
 }
 
 export interface Message {

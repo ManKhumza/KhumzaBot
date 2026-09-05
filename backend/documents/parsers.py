@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from typing import List
 from pathlib import Path
@@ -22,20 +23,25 @@ class ParseResult:
     metadata: dict
 
 async def parse_document(file_path: Path, mime_type: str) -> ParseResult:
+    """Parse on a worker thread so large files do not block the API event loop."""
+    return await asyncio.to_thread(_parse_document_sync, file_path, mime_type)
+
+
+def _parse_document_sync(file_path: Path, mime_type: str) -> ParseResult:
     if mime_type == "application/pdf":
-        return await _parse_pdf(file_path)
+        return _parse_pdf(file_path)
     elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        return await _parse_docx(file_path)
+        return _parse_docx(file_path)
     elif mime_type in ("text/plain", "text/markdown"):
-        return await _parse_text(file_path)
+        return _parse_text(file_path)
     elif mime_type == "text/csv":
-        return await _parse_csv(file_path)
+        return _parse_csv(file_path)
     elif mime_type in ("text/html", "application/xhtml+xml"):
-        return await _parse_html(file_path)
+        return _parse_html(file_path)
     else:
         raise ValueError(f"Unsupported MIME type: {mime_type}")
 
-async def _parse_pdf(file_path: Path) -> ParseResult:
+def _parse_pdf(file_path: Path) -> ParseResult:
     pages = []
     full_text_parts = []
     
@@ -67,7 +73,7 @@ async def _parse_pdf(file_path: Path) -> ParseResult:
         metadata={"parser": "pypdf"},
     )
 
-async def _parse_docx(file_path: Path) -> ParseResult:
+def _parse_docx(file_path: Path) -> ParseResult:
     doc = docx.Document(file_path)
     pages = []
     full_text_parts = []
@@ -100,7 +106,7 @@ async def _parse_docx(file_path: Path) -> ParseResult:
         metadata={"parser": "python-docx"},
     )
 
-async def _parse_text(file_path: Path) -> ParseResult:
+def _parse_text(file_path: Path) -> ParseResult:
     text = file_path.read_text(encoding="utf-8", errors="replace")
     return ParseResult(
         full_text=text,
@@ -110,7 +116,7 @@ async def _parse_text(file_path: Path) -> ParseResult:
         metadata={"parser": "text"},
     )
 
-async def _parse_csv(file_path: Path) -> ParseResult:
+def _parse_csv(file_path: Path) -> ParseResult:
     rows = []
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
@@ -129,7 +135,7 @@ async def _parse_csv(file_path: Path) -> ParseResult:
         metadata={"parser": "csv", "columns": headers},
     )
 
-async def _parse_html(file_path: Path) -> ParseResult:
+def _parse_html(file_path: Path) -> ParseResult:
     html = file_path.read_text(encoding="utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
     

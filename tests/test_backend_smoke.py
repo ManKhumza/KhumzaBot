@@ -29,6 +29,7 @@ def test_bootstrap_login_and_protected_model_endpoints(tmp_path, monkeypatch):
         assert client.get("/health/ready").status_code == 401
         assert client.get("/health/ready", headers=transport_headers).json()["status"] == "ready"
         assert client.get("/api/v1/models").status_code == 401
+        assert client.get("/api/v1/auth/status", headers=transport_headers).json() == {"needsSetup": True}
 
         login = client.post(
             "/api/v1/auth/login",
@@ -36,6 +37,7 @@ def test_bootstrap_login_and_protected_model_endpoints(tmp_path, monkeypatch):
             headers=transport_headers,
         )
         assert login.status_code == 200, login.text
+        assert client.get("/api/v1/auth/status", headers=transport_headers).json() == {"needsSetup": False}
         headers = {
             **transport_headers,
             "Authorization": f"Bearer {login.json()['token']}",
@@ -57,6 +59,41 @@ def test_bootstrap_login_and_protected_model_endpoints(tmp_path, monkeypatch):
         login_entry = next(item for item in audit.json() if item["action"] == "auth.login_success")
         assert login_entry["actorName"] == "admin"
         assert login_entry["metadata"]["username"] == "admin"
+
+        create_user = client.post(
+            "/api/v1/admin/users",
+            headers=headers,
+            json={
+                "username": "operator",
+                "password": "Temporary-12345!",
+                "roles": ["operator"],
+            },
+        )
+        assert create_user.status_code == 200, create_user.text
+
+        operator_login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "operator", "password": "Temporary-12345!"},
+            headers=transport_headers,
+        )
+        operator_headers = {
+            **transport_headers,
+            "Authorization": f"Bearer {operator_login.json()['token']}",
+        }
+        password_gate = client.get("/api/v1/models", headers=operator_headers)
+        assert password_gate.status_code == 403
+        assert password_gate.json()["detail"] == "Password change required"
+
+        password_change = client.post(
+            "/api/v1/auth/change-password",
+            headers=operator_headers,
+            json={
+                "currentPassword": "Temporary-12345!",
+                "newPassword": "Operator-New-12345!",
+            },
+        )
+        assert password_change.status_code == 200, password_change.text
+        assert client.get("/api/v1/models", headers=operator_headers).status_code == 200
 
         logout = client.post("/api/v1/auth/logout", headers=headers)
         assert logout.status_code == 200, logout.text

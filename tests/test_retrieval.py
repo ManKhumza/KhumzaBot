@@ -85,3 +85,12 @@ def test_retrieval_mutable_default_argument_fixed(tmp_path):
         assert filter_params_param is not None
         # Default should be None, not []
         assert filter_params_param.default is None or filter_params_param.default == inspect.Parameter.empty
+
+
+def test_vector_delete_batches_large_id_lists(tmp_path):
+    """Cleanup does not exceed SQLite's bound-parameter limit."""
+    import asyncio
+
+    store = VectorStore(str(tmp_path / "vectors.db"), 384)
+    asyncio.run(store.delete_chunks([f"chunk-{index}" for index in range(2_000)]))
+    store.close()

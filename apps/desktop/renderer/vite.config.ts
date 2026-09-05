@@ -29,5 +29,7 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // React Fast Refresh injects an inline preamble that Electron's CSP blocks.
+    hmr: false,
   },
 });

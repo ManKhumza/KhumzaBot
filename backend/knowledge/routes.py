@@ -8,6 +8,7 @@ import aiofiles
 from pathlib import Path
 import logging
 import hashlib
+import psutil
 from datetime import datetime
 
 from backend.auth.dependencies import get_db, get_current_user, require_permission
@@ -48,7 +49,7 @@ class CreateCollectionRequest(BaseModel):
     chunkingConfig: dict = Field(default_factory=dict)
 
 class DocumentPathsRequest(BaseModel):
-    filePaths: List[str]
+    filePaths: List[str] = Field(..., min_length=1, max_length=100)
 
 class DocumentResponse(BaseModel):
     id: str
@@ -70,6 +71,8 @@ class DocumentResponse(BaseModel):
     uploadedAt: str
     processedAt: Optional[str]
     disabledAt: Optional[str]
+    ingestionStage: Optional[str]
+    ingestionProgress: Optional[int]
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -89,6 +92,26 @@ class SearchResultResponse(BaseModel):
     pageEnd: int
     sectionTitle: Optional[str]
     metadata: dict
+
+
+COPY_BUFFER_BYTES = 1024 * 1024
+SUPPORTED_DOCUMENT_EXTENSIONS = {'.txt', '.md', '.pdf', '.docx', '.csv', '.html', '.htm'}
+MEMORY_MULTIPLIERS = {
+    '.txt': 4, '.md': 4, '.csv': 5, '.html': 6, '.htm': 6,
+    '.pdf': 10, '.docx': 8,
+}
+
+
+async def copy_file_with_hash(source: Path, destination: Path) -> tuple[str, int]:
+    """Copy without loading the entire source into memory."""
+    digest = hashlib.sha256()
+    size = 0
+    async with aiofiles.open(source, "rb") as source_file, aiofiles.open(destination, "wb") as destination_file:
+        while chunk := await source_file.read(COPY_BUFFER_BYTES):
+            digest.update(chunk)
+            size += len(chunk)
+            await destination_file.write(chunk)
+    return digest.hexdigest(), size
 
 @router.get("/collections", response_model=List[CollectionResponse])
 async def list_collections(
@@ -193,21 +216,48 @@ async def upload_documents(
     settings = get_settings()
     results = []
     job_ids = []
-    
-    for file_path in request.filePaths:
-        source = Path(file_path).expanduser().resolve()
-        if not source.is_file():
-            logger.warning(f"Skipping missing file: {source}")
-            continue
+    max_document_bytes = max(1, settings.max_document_size_mb) * 1024 * 1024
+    sources: list[tuple[Path, int]] = []
+    available_memory = psutil.virtual_memory().available
+    memory_budget = max(0, available_memory - 512 * 1024 * 1024)
 
+    for file_path in request.filePaths:
+        try:
+            source = Path(file_path).expanduser().resolve(strict=True)
+            size = source.stat().st_size
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(400, f"Could not access document: {file_path}") from exc
+        if not source.is_file():
+            raise HTTPException(400, f"Document is not a file: {source.name}")
+        if source.suffix.lower() not in SUPPORTED_DOCUMENT_EXTENSIONS:
+            raise HTTPException(415, f"Unsupported document type: {source.suffix or source.name}")
+        if size <= 0:
+            raise HTTPException(400, f"Document is empty: {source.name}")
+        if size > max_document_bytes:
+            raise HTTPException(
+                413,
+                f"{source.name} is larger than the {settings.max_document_size_mb} MB document limit",
+            )
+        estimated_peak_memory = size * MEMORY_MULTIPLIERS[source.suffix.lower()]
+        if estimated_peak_memory > memory_budget:
+            estimated_mb = max(1, estimated_peak_memory // (1024 * 1024))
+            available_mb = max(1, available_memory // (1024 * 1024))
+            raise HTTPException(
+                413,
+                f"{source.name} may need about {estimated_mb} MB of working memory, "
+                f"but only {available_mb} MB is currently available",
+            )
+        sources.append((source, size))
+
+    collection_dir = Path(settings.knowledge_dir) / "collections" / collection_id / "source"
+    collection_dir.mkdir(parents=True, exist_ok=True)
+    required_bytes = sum(size for _, size in sources) * 2
+    if required_bytes > shutil.disk_usage(collection_dir).free:
+        raise HTTPException(507, "Not enough free disk space to ingest the selected documents")
+
+    duplicate_names: list[str] = []
+    for source, _ in sources:
         ext = source.suffix.lower()
-        allowed_extensions = {'.txt', '.md', '.pdf', '.docx', '.csv', '.html', '.htm'}
-        if ext not in allowed_extensions:
-            logger.warning(f"Skipping file with unsupported extension: {source.name}")
-            continue
-        
-        collection_dir = Path(settings.knowledge_dir) / "collections" / collection_id / "source"
-        collection_dir.mkdir(parents=True, exist_ok=True)
         
         dest = collection_dir / source.name
         counter = 1
@@ -215,17 +265,19 @@ async def upload_documents(
             dest = collection_dir / f"{source.stem}_{counter}{ext}"
             counter += 1
 
-        async with aiofiles.open(source, "rb") as f:
-            content = await f.read()
-        async with aiofiles.open(dest, "wb") as f:
-            await f.write(content)
+        try:
+            file_hash, size_bytes = await copy_file_with_hash(source, dest)
+        except OSError as exc:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(500, f"Could not copy document: {source.name}") from exc
         
-        file_hash = hashlib.sha256(content).hexdigest()
-        
-        existing = db.query(Document).filter(Document.file_hash == file_hash).first()
+        existing = db.query(Document).filter(
+            Document.collection_id == collection_id,
+            Document.file_hash == file_hash,
+        ).first()
         if existing:
             dest.unlink(missing_ok=True)
-            logger.warning(f"Duplicate file: {source.name}")
+            duplicate_names.append(source.name)
             continue
         
         mime_types = {
@@ -240,7 +292,7 @@ async def upload_documents(
             original_filename=source.name,
             filepath=str(dest.relative_to(settings.knowledge_dir)),
             mime_type=mime_types[ext],
-            size_bytes=len(content),
+            size_bytes=size_bytes,
             file_hash=file_hash,
             uploaded_by=current_user.id,
             status="queued",
@@ -254,7 +306,11 @@ async def upload_documents(
         db.add(job)
         job_ids.append(job.id)
         results.append(document)
-    
+
+    if not results:
+        detail = "All selected documents are already in this collection" if duplicate_names else "No documents were accepted"
+        raise HTTPException(409 if duplicate_names else 400, detail)
+
     db.commit()
     for doc in results:
         db.refresh(doc)
@@ -379,6 +435,11 @@ def collection_to_response(collection: Collection, permission: str) -> Collectio
     )
 
 def document_to_response(doc: Document) -> DocumentResponse:
+    latest_job = max(
+        doc.ingestion_jobs,
+        key=lambda job: job.created_at or datetime.min,
+        default=None,
+    )
     return DocumentResponse(
         id=doc.id,
         collectionId=doc.collection_id,
@@ -399,4 +460,6 @@ def document_to_response(doc: Document) -> DocumentResponse:
         uploadedAt=doc.uploaded_at.isoformat() if doc.uploaded_at else "",
         processedAt=doc.processed_at.isoformat() if doc.processed_at else None,
         disabledAt=doc.disabled_at.isoformat() if doc.disabled_at else None,
+        ingestionStage=latest_job.current_stage if latest_job else None,
+        ingestionProgress=latest_job.progress if latest_job else None,
     )

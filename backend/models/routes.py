@@ -255,6 +255,17 @@ async def estimate_model_requirements(
     }
 
 def model_to_response(model: Model) -> ModelResponse:
+    raw_compatibility = model.hardware_compatibility or {}
+    compatibility = {
+        "status": raw_compatibility.get("status", raw_compatibility.get("compatibility", "COMPATIBLE")),
+        "estimatedMemoryMB": raw_compatibility.get(
+            "estimatedMemoryMB",
+            raw_compatibility.get("estimatedRAMMB", round((model.size_bytes or 0) / (1024 ** 2))),
+        ),
+        "estimatedVramMB": raw_compatibility.get("estimatedVramMB", raw_compatibility.get("estimatedVRAMMB", 0)),
+        "warnings": raw_compatibility.get("warnings") if isinstance(raw_compatibility.get("warnings"), list) else [],
+        "reasons": raw_compatibility.get("reasons") if isinstance(raw_compatibility.get("reasons"), list) else [],
+    }
     return ModelResponse(
         id=model.id,
         name=model.name,
@@ -270,7 +281,7 @@ def model_to_response(model: Model) -> ModelResponse:
         status=model.status,
         validationError=model.validation_error,
         metadata=model.model_metadata or {},
-        hardwareCompatibility=model.hardware_compatibility or {},
+        hardwareCompatibility=compatibility,
         importedBy=model.imported_by,
         importedAt=model.imported_at.isoformat() if model.imported_at else "",
         activatedAt=model.activated_at.isoformat() if model.activated_at else None,

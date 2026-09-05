@@ -142,6 +142,12 @@ class VectorStore:
             
             chunk = await self._get_chunk_details(chunk_id)
             if chunk:
+                metadata = (
+                    chunk.chunk_metadata
+                    if isinstance(chunk.chunk_metadata, dict)
+                    else json.loads(chunk.chunk_metadata) if chunk.chunk_metadata else {}
+                )
+                metadata = {key: value for key, value in metadata.items() if not key.startswith("_nocai")}
                 results.append(SearchResult(
                     chunk_id=chunk_id,
                     document_id=document_id,
@@ -151,11 +157,7 @@ class VectorStore:
                     page_start=chunk.page_start,
                     page_end=chunk.page_end,
                     section_title=chunk.section_title,
-                    metadata=(
-                        chunk.chunk_metadata
-                        if isinstance(chunk.chunk_metadata, dict)
-                        else json.loads(chunk.chunk_metadata) if chunk.chunk_metadata else {}
-                    ),
+                    metadata=metadata,
                 ))
         
         return results
@@ -163,17 +165,24 @@ class VectorStore:
     async def _get_chunk_details(self, chunk_id: str) -> Optional["Chunk"]:
         from backend.db.database import create_db_engine, get_session_factory
         from backend.config import get_settings
-        from backend.db.models import Chunk
+        from backend.db.models import Chunk, Document
         settings = get_settings()
         engine = create_db_engine(settings.database_url)
         Session = get_session_factory(engine)
         with Session() as session:
-            return session.query(Chunk).filter(Chunk.id == chunk_id).first()
+            return session.query(Chunk).join(Document).filter(
+                Chunk.id == chunk_id,
+                Document.status == "ready",
+            ).first()
     
     async def delete_chunks(self, chunk_ids: List[str]) -> None:
+        if not chunk_ids:
+            return
         conn = self._get_conn()
-        placeholders = ",".join("?" * len(chunk_ids))
-        conn.execute(f"DELETE FROM chunks_vec WHERE chunk_id IN ({placeholders})", chunk_ids)
+        for start in range(0, len(chunk_ids), 500):
+            batch = chunk_ids[start:start + 500]
+            placeholders = ",".join("?" * len(batch))
+            conn.execute(f"DELETE FROM chunks_vec WHERE chunk_id IN ({placeholders})", batch)
         conn.commit()
     
     async def delete_collection(self, collection_id: str) -> None:

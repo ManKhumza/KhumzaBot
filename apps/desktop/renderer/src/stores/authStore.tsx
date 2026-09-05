@@ -1,6 +1,5 @@
 import React from 'react';
 import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
 import type { User, Session } from '@/types';
 import { nocaiAPI } from '@/utils/api';
 
@@ -19,12 +18,11 @@ interface AuthState {
 }
 
 export const useAuthStore = create<AuthState>()(
-  persist(
-    (set, get) => ({
+    (set) => ({
       user: null,
       session: null,
       isAuthenticated: false,
-      isLoading: false,
+      isLoading: true,
       error: null,
 
       login: async (username: string, password: string) => {
@@ -80,7 +78,14 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true, error: null });
         try {
           await nocaiAPI.auth.changePassword({ currentPassword, newPassword });
-          set({ isLoading: false });
+          set((state) => {
+            const user = state.user ? { ...state.user, mustChangePassword: false } : null;
+            return {
+              user,
+              session: state.session && user ? { ...state.session, user } : state.session,
+              isLoading: false,
+            };
+          });
         } catch (error: any) {
           set({ isLoading: false, error: error.message || 'Password change failed' });
           throw error;
@@ -88,17 +93,7 @@ export const useAuthStore = create<AuthState>()(
       },
 
       clearError: () => set({ error: null }),
-    }),
-    {
-      name: 'nocai-auth',
-      storage: createJSONStorage(() => localStorage),
-      partialize: (state) => ({
-        user: state.user,
-        session: state.session,
-        isAuthenticated: state.isAuthenticated,
-      }),
-    }
-  )
+    })
 );
 
 export const AuthProvider = ({ children }: { children: React.ReactNode }) => {

@@ -25,6 +25,13 @@ class ChangePasswordRequest(BaseModel):
     currentPassword: str = Field(..., min_length=1)
     newPassword: str = Field(..., min_length=12)
 
+class AuthStatusResponse(BaseModel):
+    needsSetup: bool
+
+@router.get("/status", response_model=AuthStatusResponse)
+async def get_auth_status(db: Session = Depends(get_db)):
+    return AuthStatusResponse(needsSetup=db.query(User.id).first() is None)
+
 @router.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == request.username).first()

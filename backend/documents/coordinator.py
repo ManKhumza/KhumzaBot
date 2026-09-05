@@ -7,18 +7,31 @@ import logging
 import mimetypes
 import uuid
 from datetime import datetime
+from itertools import islice
+from math import ceil
 from pathlib import Path
 
 from sqlalchemy.orm import sessionmaker
 
 from backend.config import Settings
 from backend.db.models import Chunk, Collection, Document, IngestionJob, Model
-from backend.documents.chunking import ChunkConfig, chunk_text
+from backend.documents.chunking import ChunkConfig, TextChunk, iter_text_chunks
 from backend.documents.parsers import parse_document
 from backend.inference.lifecycle import ModelLifecycleManager
 from backend.retrieval.vector_store import ChunkWithEmbedding, VectorStore
 
 logger = logging.getLogger(__name__)
+DATABASE_BATCH_SIZE = 500
+
+
+def _take_chunk_batch(iterator, batch_size: int) -> list[TextChunk]:
+    return list(islice(iterator, batch_size))
+
+
+def _delete_chunk_rows(db, chunk_ids: list[str]) -> None:
+    for start in range(0, len(chunk_ids), DATABASE_BATCH_SIZE):
+        batch = chunk_ids[start:start + DATABASE_BATCH_SIZE]
+        db.query(Chunk).filter(Chunk.id.in_(batch)).delete(synchronize_session=False)
 
 
 class IngestionCoordinator:
@@ -128,13 +141,39 @@ class IngestionCoordinator:
             document.status = "parsing"
             db.commit()
 
+            staged_vector_ids: list[str] = []
+            replacement_committed = False
             try:
+                existing_chunks = db.query(Chunk.id, Chunk.chunk_metadata).filter(
+                    Chunk.document_id == document.id
+                ).all()
+                marker_ids = {
+                    metadata.get("_nocaiIngestionJobId")
+                    for _, metadata in existing_chunks
+                    if isinstance(metadata, dict) and metadata.get("_nocaiIngestionJobId")
+                }
+                marker_statuses = dict(
+                    db.query(IngestionJob.id, IngestionJob.status).filter(IngestionJob.id.in_(marker_ids)).all()
+                ) if marker_ids else {}
+                stale_ids = [
+                    chunk_id for chunk_id, metadata in existing_chunks
+                    if isinstance(metadata, dict)
+                    and (marker := metadata.get("_nocaiIngestionJobId"))
+                    and marker_statuses.get(marker) != "completed"
+                ]
+                stale_id_set = set(stale_ids)
+                old_ids = [chunk_id for chunk_id, _ in existing_chunks if chunk_id not in stale_id_set]
+                if stale_ids:
+                    await self.vector_store.delete_chunks(stale_ids)
+                    _delete_chunk_rows(db, stale_ids)
+                    db.commit()
+
                 source = Path(self.settings.knowledge_dir) / document.filepath
                 if not source.is_file():
                     raise FileNotFoundError("The uploaded source file is missing")
                 mime = document.mime_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream"
                 parsed = await parse_document(source, mime)
-                if not parsed.full_text.strip():
+                if not parsed.full_text or parsed.full_text.isspace():
                     raise ValueError("No extractable text was found in the document")
 
                 document.page_count = parsed.page_count
@@ -145,14 +184,18 @@ class IngestionCoordinator:
                 db.commit()
 
                 raw_cfg = collection.chunking_config or {}
-                chunks = chunk_text(parsed.full_text, ChunkConfig(
-                    chunk_size=int(raw_cfg.get("chunkSize", 512)),
-                    chunk_overlap=int(raw_cfg.get("chunkOverlap", 50)),
+                chunk_config = ChunkConfig(
+                    chunk_size=int(raw_cfg.get("chunkSize", self.settings.default_chunk_size)),
+                    chunk_overlap=int(raw_cfg.get("chunkOverlap", self.settings.default_chunk_overlap)),
                     min_chunk_size=max(1, int(raw_cfg.get("minChunkSize", 20))),
                     respect_boundaries=bool(raw_cfg.get("respectBoundaries", True)),
-                ))
-                if not chunks:
-                    raise ValueError("Document text was too short to create a searchable chunk")
+                )
+                source_text = parsed.full_text
+                effective_chunk_size = max(1, chunk_config.chunk_size - chunk_config.chunk_overlap)
+                estimated_chunks = max(1, ceil((len(source_text) / 4) / effective_chunk_size))
+                chunk_iterator = iter_text_chunks(source_text, chunk_config)
+                del parsed
+                del source_text
 
                 embedding_model = db.get(Model, collection.embedding_model_id)
                 if embedding_model is None or embedding_model.role != "embedding":
@@ -166,44 +209,74 @@ class IngestionCoordinator:
                 job.progress = 30
                 db.commit()
 
-                old_ids = [row[0] for row in db.query(Chunk.id).filter(Chunk.document_id == document.id).all()]
-                if old_ids:
-                    await self.vector_store.delete_chunks(old_ids)
-                db.query(Chunk).filter(Chunk.document_id == document.id).delete(synchronize_session=False)
+                batch_size = max(1, min(64, self.settings.ingestion_embedding_batch_size))
+                processed_chunks = 0
 
-                indexed: list[ChunkWithEmbedding] = []
-                for index, item in enumerate(chunks):
-                    latest = db.get(IngestionJob, job_id)
-                    if latest is None or latest.status == "cancelled":
-                        db.rollback()
+                while True:
+                    batch = await asyncio.to_thread(_take_chunk_batch, chunk_iterator, batch_size)
+                    if not batch:
+                        break
+                    db.refresh(job)
+                    if job.status == "cancelled":
+                        if staged_vector_ids:
+                            await self.vector_store.delete_chunks(staged_vector_ids)
+                            _delete_chunk_rows(db, staged_vector_ids)
+                        document.status = "failed"
+                        document.error_message = "Ingestion cancelled"
+                        job.current_stage = "cancelled"
+                        job.completed_at = datetime.utcnow()
+                        db.commit()
                         return
-                    embedding = await provider.embed_single(item.content)
-                    if len(embedding) != self.vector_store.embedding_dim:
-                        raise ValueError(
-                            f"Embedding dimension mismatch: expected {self.vector_store.embedding_dim}, got {len(embedding)}"
+
+                    texts = [item.content for item in batch]
+                    if hasattr(provider, "embed_batch"):
+                        embeddings = await provider.embed_batch(texts)
+                    else:
+                        # Keep third-party/test providers using the older protocol working.
+                        embeddings = [await provider.embed_single(text) for text in texts]
+                    if len(embeddings) != len(batch):
+                        raise RuntimeError(
+                            f"Embedding runtime returned {len(embeddings)} vectors for {len(batch)} chunks"
                         )
-                    record = Chunk(
-                        id=str(uuid.uuid4()), document_id=document.id,
-                        collection_id=document.collection_id, chunk_index=index,
-                        content=item.content, token_count=item.token_count,
-                        page_start=item.page_start, page_end=item.page_end,
-                        section_title=item.section_title, chunk_metadata=item.metadata or {},
-                    )
-                    db.add(record)
-                    indexed.append(ChunkWithEmbedding(record, embedding))
-                    job.progress = 30 + int(50 * (index + 1) / len(chunks))
-                    db.flush()
+                    indexed_batch: list[ChunkWithEmbedding] = []
+                    for offset, (item, embedding) in enumerate(zip(batch, embeddings)):
+                        if len(embedding) != self.vector_store.embedding_dim:
+                            raise ValueError(
+                                f"Embedding dimension mismatch: expected {self.vector_store.embedding_dim}, got {len(embedding)}"
+                            )
+                        record = Chunk(
+                            id=str(uuid.uuid4()), document_id=document.id,
+                            collection_id=document.collection_id, chunk_index=processed_chunks + offset,
+                            content=item.content, token_count=item.token_count,
+                            page_start=item.page_start, page_end=item.page_end,
+                            section_title=item.section_title,
+                            chunk_metadata={**(item.metadata or {}), "_nocaiIngestionJobId": job_id},
+                        )
+                        indexed_batch.append(ChunkWithEmbedding(record, embedding))
+
+                    batch_ids = [record.chunk.id for record in indexed_batch]
+                    staged_vector_ids.extend(batch_ids)
+                    db.add_all([record.chunk for record in indexed_batch])
+                    db.commit()
+                    await self.vector_store.add_chunks(indexed_batch)
+                    processed_chunks += len(batch)
+                    job.progress = 30 + int(50 * min(processed_chunks, estimated_chunks) / estimated_chunks)
+                    db.commit()
+
+                if processed_chunks == 0:
+                    raise ValueError("Document text was too short to create a searchable chunk")
 
                 job.current_stage = "indexing"
                 document.status = "indexing"
                 job.progress = 85
                 db.commit()
-                await self.vector_store.add_chunks(indexed)
+
+                _delete_chunk_rows(db, old_ids)
 
                 document = db.get(Document, document.id)
                 job = db.get(IngestionJob, job_id)
                 document.status = "ready"
-                document.chunk_count = len(indexed)
+                document.chunk_count = processed_chunks
                 document.embedded_model_id = embedding_model.id
                 document.embedded_config = collection.embedding_config or {}
                 document.processed_at = datetime.utcnow()
@@ -220,8 +293,21 @@ class IngestionCoordinator:
                     row[0] or 0 for row in db.query(Document.size_bytes).filter(Document.collection_id == collection.id)
                 )
                 db.commit()
+                replacement_committed = True
+
+                if old_ids:
+                    try:
+                        await self.vector_store.delete_chunks(old_ids)
+                    except Exception:
+                        logger.exception("Could not remove superseded vectors for document %s", document.id)
             except Exception as exc:
                 db.rollback()
+                if staged_vector_ids and not replacement_committed:
+                    try:
+                        await self.vector_store.delete_chunks(staged_vector_ids)
+                    except Exception:
+                        logger.exception("Could not clean up staged vectors for job %s", job_id)
+                    _delete_chunk_rows(db, staged_vector_ids)
                 job = db.get(IngestionJob, job_id)
                 document = db.get(Document, job.document_id) if job else None
                 message = str(exc)[:2000]

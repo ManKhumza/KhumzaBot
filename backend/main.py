@@ -170,7 +170,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="NOC AI Assistant API",
-        version="1.0.1",
+        version="1.0.2",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -200,7 +200,7 @@ def create_app() -> FastAPI:
 
         if request.url.path in [
             "/health", "/health/ready", "/health/live",
-            "/api/v1/auth/login", "/internal/prepare-shutdown",
+            "/api/v1/auth/login", "/api/v1/auth/status", "/internal/prepare-shutdown",
         ]:
             return await call_next(request)
         

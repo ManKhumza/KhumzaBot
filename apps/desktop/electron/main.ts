@@ -1,8 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, session } from 'electron';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { spawn, SpawnOptions } from 'child_process';
 import { randomBytes } from 'crypto';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 const isDev = !app.isPackaged;
 
 let mainWindow: BrowserWindow | null = null;
@@ -11,13 +11,39 @@ let backendToken: string | null = null;
 let sessionToken: string | null = null;
 let backendPort: number | null = null;
 let isShuttingDown = false;
+let lastRendererRecoveryAt = 0;
+let unresponsiveDialogOpen = false;
+let backendStartupPromise: Promise<void> | null = null;
 const nativeFetch = globalThis.fetch;
+
+async function getResponseError(response: Response): Promise<Error> {
+  const fallback = `Local service request failed (${response.status})`;
+  let body = '';
+  try {
+    body = await response.text();
+    const parsed = JSON.parse(body) as { detail?: unknown; message?: unknown };
+    if (typeof parsed.detail === 'string') return new Error(parsed.detail);
+    if (typeof parsed.message === 'string') return new Error(parsed.message);
+    if (Array.isArray(parsed.detail)) {
+      const messages = parsed.detail
+        .map((item) => typeof item === 'object' && item && 'msg' in item ? String(item.msg) : '')
+        .filter(Boolean);
+      if (messages.length) return new Error(messages.join('. '));
+    }
+  } catch {
+    // A non-JSON response is handled below without exposing an HTML error page.
+  }
+  return new Error(body && !body.trimStart().startsWith('<') ? body : fallback);
+}
 
 /** Add the private Electron-to-backend credential to every loopback call. */
 async function fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  if (backendStartupPromise) await backendStartupPromise;
   const headers = new Headers(init.headers);
   if (backendToken) headers.set('X-NOC-AI-Backend-Token', backendToken);
-  return nativeFetch(input, { ...init, headers });
+  const response = await nativeFetch(input, { ...init, headers });
+  if (!response.ok) throw await getResponseError(response);
+  return response;
 }
 
 async function createWindow(): Promise<BrowserWindow> {
@@ -44,6 +70,53 @@ async function createWindow(): Promise<BrowserWindow> {
       experimentalFeatures: false,
       spellcheck: false,
     },
+  });
+  const window = mainWindow;
+
+  window.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) console.warn(`[renderer] ${message} (${sourceId}:${line})`);
+  });
+
+  window.webContents.on('render-process-gone', (_event, details) => {
+    if (isShuttingDown || window.isDestroyed() || details.reason === 'clean-exit') return;
+    console.error('Renderer process exited unexpectedly', details);
+    const now = Date.now();
+    if (now - lastRendererRecoveryAt > 15000) {
+      lastRendererRecoveryAt = now;
+      setTimeout(() => {
+        if (!window.isDestroyed()) window.reload();
+      }, 250);
+      return;
+    }
+    void dialog.showMessageBox(window, {
+      type: 'error',
+      title: 'NOC AI Assistant recovered from a display failure',
+      message: 'The interface stopped unexpectedly more than once.',
+      detail: 'Your local data is intact. Reload the interface to continue.',
+      buttons: ['Reload interface', 'Close application'],
+      defaultId: 0,
+      cancelId: 1,
+    }).then(({ response }) => {
+      if (response === 0 && !window.isDestroyed()) window.reload();
+      else if (response !== 0) void shutdown();
+    });
+  });
+
+  window.on('unresponsive', () => {
+    if (isShuttingDown || window.isDestroyed() || unresponsiveDialogOpen) return;
+    unresponsiveDialogOpen = true;
+    void dialog.showMessageBox(window, {
+      type: 'warning',
+      title: 'NOC AI Assistant is taking longer than expected',
+      message: 'The interface is not responding yet.',
+      detail: 'A large local operation may still be running. You can wait or reload only the interface.',
+      buttons: ['Wait', 'Reload interface'],
+      defaultId: 0,
+      cancelId: 0,
+    }).then(({ response }) => {
+      unresponsiveDialogOpen = false;
+      if (response === 1 && !window.isDestroyed()) window.reload();
+    });
   });
 
   // Block all navigation except explicit allow-list
@@ -139,7 +212,7 @@ function findBackendCommand(): { command: string; prefixArgs: string[]; cwd: str
     };
   }
 
-  const projectRoot = join(__dirname, '../../../..');
+  const projectRoot = join(__dirname, '../../../../..');
   const command = join(projectRoot, '.venv', 'Scripts', 'python.exe');
   if (!existsSync(command)) throw new Error(`Python environment not found: ${command}`);
   return {
@@ -208,7 +281,8 @@ async function startBackend(): Promise<number> {
   });
 
   // Wait for port to be listening
-  await waitForPort(backendPort!, 10000);
+  // First launch may need to copy and initialize the bundled embedding model.
+  await waitForPort(backendPort!, 60000);
   
   return backendPort!;
 }
@@ -216,6 +290,10 @@ async function startBackend(): Promise<number> {
 async function waitForPort(port: number, timeout: number): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
+    if (!backendProcess) {
+      throw new Error('Backend exited before opening its local port');
+    }
+
     try {
       await new Promise<void>((resolve, reject) => {
         const net = require('net');
@@ -240,8 +318,8 @@ async function checkBackendHealth(): Promise<void> {
   const maxRetries = 30;
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const response = await fetch(`http://127.0.0.1:${backendPort}/health/ready`, {
-        headers: { 'Authorization': `Bearer ${backendToken}` },
+      const response = await nativeFetch(`http://127.0.0.1:${backendPort}/health/ready`, {
+        headers: { 'X-NOC-AI-Backend-Token': backendToken || '' },
         signal: AbortSignal.timeout(2000),
       });
       if (response.ok) {
@@ -256,6 +334,20 @@ async function checkBackendHealth(): Promise<void> {
     await new Promise(r => setTimeout(r, 1000));
   }
   throw new Error('Backend health check timeout');
+}
+
+async function startBackendUntilReady(): Promise<void> {
+  await startBackend();
+  await checkBackendHealth();
+}
+
+async function restartBackendService(): Promise<void> {
+  const restartPromise = (async () => {
+    await stopBackend();
+    await startBackendUntilReady();
+  })();
+  backendStartupPromise = restartPromise;
+  await restartPromise;
 }
 
 async function shutdown(): Promise<void> {
@@ -325,9 +417,7 @@ function setupIpcHandlers(): void {
   ipcMain.handle('app:getBackendPort', () => backendPort);
   
   ipcMain.handle('backend:restart', async () => {
-    await stopBackend();
-    await startBackend();
-    await checkBackendHealth();
+    await restartBackendService();
     return { success: true };
   });
   
@@ -386,6 +476,11 @@ function setupIpcHandlers(): void {
   });
   
   // Backend API proxy - expose all nocaiAPI methods
+  ipcMain.handle('nocai:auth:getStatus', async () => {
+    const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/auth/status`);
+    return response.json();
+  });
+
   ipcMain.handle('nocai:auth:login', async (event, credentials) => {
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/auth/login`, {
       method: 'POST',
@@ -399,6 +494,7 @@ function setupIpcHandlers(): void {
   });
   
   ipcMain.handle('nocai:auth:logout', async () => {
+    if (!sessionToken) return { success: true };
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/auth/logout`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${sessionToken}` },
@@ -410,6 +506,7 @@ function setupIpcHandlers(): void {
   });
   
   ipcMain.handle('nocai:auth:getSession', async () => {
+    if (!sessionToken) return null;
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/auth/session`, {
       headers: { 'Authorization': `Bearer ${sessionToken}` },
     });
@@ -460,6 +557,16 @@ function setupIpcHandlers(): void {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
       body: JSON.stringify({ title }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+  });
+
+  ipcMain.handle('nocai:chat:updateConversation', async (event, { id, updates }) => {
+    const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/conversations/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
+      body: JSON.stringify(updates),
     });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
@@ -596,12 +703,33 @@ function setupIpcHandlers(): void {
     if (!response.ok) throw new Error(await response.text());
     return response.json();
   });
+
+  ipcMain.handle('nocai:knowledge:selectDocuments', async () => {
+    if (!mainWindow) return [];
+    const selection = await dialog.showOpenDialog(mainWindow, {
+      title: 'Select documents',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: 'Supported documents', extensions: ['txt', 'md', 'pdf', 'docx', 'csv', 'html', 'htm'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
+    });
+    if (selection.canceled) return [];
+    return selection.filePaths.flatMap((path) => {
+      try {
+        const stats = statSync(path);
+        return stats.isFile() ? [{ path, name: basename(path), size: stats.size }] : [];
+      } catch {
+        return [];
+      }
+    });
+  });
   
-  ipcMain.handle('nocai:knowledge:uploadDocuments', async (event, { collectionId, files }) => {
+  ipcMain.handle('nocai:knowledge:uploadDocuments', async (event, { collectionId, filePaths }) => {
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/knowledge/collections/${collectionId}/documents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
-      body: JSON.stringify({ filePaths: files }),
+      body: JSON.stringify({ filePaths }),
     });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
@@ -716,9 +844,7 @@ function setupIpcHandlers(): void {
   });
   
   ipcMain.handle('nocai:admin:restartBackend', async () => {
-    await stopBackend();
-    await startBackend();
-    await checkBackendHealth();
+    await restartBackendService();
     return { success: true };
   });
   
@@ -781,9 +907,7 @@ function setupIpcHandlers(): void {
   });
   
   ipcMain.handle('nocai:system:restartBackend', async () => {
-    await stopBackend();
-    await startBackend();
-    await checkBackendHealth();
+    await restartBackendService();
     return { success: true };
   });
   
@@ -809,13 +933,14 @@ app.on('ready', async () => {
     }
   });
   
+  const startupPromise = startBackendUntilReady();
+  backendStartupPromise = startupPromise;
   await createWindow();
   
   // Start backend
   try {
     mainWindow?.webContents.send('backend:status', { status: 'starting' });
-    await startBackend();
-    await checkBackendHealth();
+    await startupPromise;
     mainWindow?.webContents.send('backend:status', { status: 'ready', port: backendPort });
     mainWindow?.webContents.send('app:ready', {
       version: app.getVersion(),

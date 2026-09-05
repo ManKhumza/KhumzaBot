@@ -1,7 +1,6 @@
 import React from 'react';
 import { AlertCircle, RefreshCw, X } from 'lucide-react';
 import { clsx } from 'clsx';
-import { useTheme } from '@/components/ThemeProvider';
 
 interface BackendStatusBannerProps {
   isReady: boolean;
@@ -10,7 +9,6 @@ interface BackendStatusBannerProps {
 }
 
 export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBannerProps) => {
-  const { resolvedTheme } = useTheme();
   const [dismissed, setDismissed] = React.useState(false);
 
   React.useEffect(() => setDismissed(false), [isReady, error]);
@@ -54,13 +52,13 @@ export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBa
             <button
               onClick={onRetry}
               className={clsx(
-                'px-3 py-1.5 text-sm font-medium rounded-lg transition-colors',
+                'inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg transition-colors',
                 error
                   ? 'bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-300'
                   : 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-300'
               )}
             >
-              <RefreshCw className="w-4 h-4 mr-1" />
+              <RefreshCw className="w-4 h-4" />
               Retry
             </button>
           )}

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '@/stores/authStore';
 import { nocaiAPI } from '@/utils/api';
 import { Button } from '@/components/common/Button';
@@ -6,32 +7,46 @@ import { Input } from '@/components/common/Input';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/common/Card';
 import { Badge } from '@/components/common/Badge';
 import { Dialog, AlertDialog } from '@/components/common/Dialog';
-import { Moon, Sun, Monitor, Cpu, Database, Shield, HardDrive, Key, Bell, Save, Loader2 } from 'lucide-react';
+import { Moon, Sun, Monitor, Cpu, Database, Shield, HardDrive, Key, Bell, Save, Loader2, AlertTriangle, RefreshCw } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { Settings as SettingsType } from '@/types';
 
 export const Settings = () => {
-  const { user } = useAuthStore();
+  const { user, changePassword } = useAuthStore();
+  const location = useLocation();
+  const navigate = useNavigate();
   const [settings, setSettings] = useState<SettingsType | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'appearance' | 'models' | 'knowledge' | 'storage' | 'security' | 'diagnostics'>('appearance');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPasswordDialog, setShowPasswordDialog] = useState(false);
   const [passwordError, setPasswordError] = useState('');
+  const passwordChangeRequired = Boolean(user?.mustChangePassword);
 
   useEffect(() => {
     loadSettings();
   }, []);
 
+  useEffect(() => {
+    if (passwordChangeRequired || new URLSearchParams(location.search).get('password') === 'required') {
+      setActiveTab('security');
+      setShowPasswordDialog(true);
+    }
+  }, [location.search, passwordChangeRequired]);
+
   const loadSettings = async () => {
+    setLoading(true);
+    setSettingsError(null);
     try {
       const data = await nocaiAPI.settings.get();
       setSettings(data);
     } catch (error) {
       console.error('Failed to load settings:', error);
+      setSettingsError(error instanceof Error ? error.message : 'Could not load settings.');
     } finally {
       setLoading(false);
     }
@@ -40,11 +55,13 @@ export const Settings = () => {
   const handleSave = async () => {
     if (!settings) return;
     setSaving(true);
+    setSettingsError(null);
     try {
-      await nocaiAPI.settings.update(settings);
-      setSaving(false);
+      setSettings(await nocaiAPI.settings.update(settings));
     } catch (error) {
       console.error('Failed to save settings:', error);
+      setSettingsError(error instanceof Error ? error.message : 'Could not save settings.');
+    } finally {
       setSaving(false);
     }
   };
@@ -59,12 +76,13 @@ export const Settings = () => {
       return;
     }
     try {
-      await nocaiAPI.auth.changePassword({ currentPassword, newPassword });
+      await changePassword(currentPassword, newPassword);
       setShowPasswordDialog(false);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
       setPasswordError('');
+      navigate('/settings', { replace: true });
     } catch (error: any) {
       setPasswordError(error.message || 'Failed to change password');
     }
@@ -87,12 +105,35 @@ export const Settings = () => {
     );
   }
 
+  if (!settings) {
+    return (
+      <div className="flex min-h-64 items-center justify-center p-6">
+        <div className="w-full max-w-md border border-border bg-card p-6 text-center">
+          <AlertTriangle className="mx-auto h-8 w-8 text-destructive" />
+          <h1 className="mt-3 text-lg font-semibold">Settings are temporarily unavailable</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{settingsError || 'The local settings service did not return data.'}</p>
+          <Button className="mt-4" onClick={loadSettings}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-foreground">Settings</h1>
         <p className="text-muted-foreground">Configure your NOC AI Assistant preferences</p>
       </div>
+
+      {settingsError && (
+        <div className="flex items-start gap-2 border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-none" />
+          <span>{settingsError}</span>
+        </div>
+      )}
 
       <Card>
         <CardHeader className="pb-2">
@@ -152,7 +193,15 @@ export const Settings = () => {
       </Card>
 
       {/* Change Password Dialog */}
-      <Dialog open={showPasswordDialog} onOpenChange={setShowPasswordDialog} title="Change Password">
+      <Dialog
+        open={showPasswordDialog}
+        onOpenChange={(open) => {
+          if (!open && passwordChangeRequired) return;
+          setShowPasswordDialog(open);
+        }}
+        title={passwordChangeRequired ? 'Set a new password' : 'Change Password'}
+        description={passwordChangeRequired ? 'Your administrator requires a password change before you continue.' : undefined}
+      >
         <div className="space-y-4">
           <Input
             label="Current Password"
@@ -179,7 +228,9 @@ export const Settings = () => {
             <div className="text-sm text-destructive">{passwordError}</div>
           )}
           <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={() => setShowPasswordDialog(false)}>Cancel</Button>
+            {!passwordChangeRequired && (
+              <Button variant="outline" onClick={() => setShowPasswordDialog(false)}>Cancel</Button>
+            )}
             <Button onClick={handleChangePassword}>Change Password</Button>
           </div>
         </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAuthStore } from '@/stores/authStore';
 import { nocaiAPI } from '@/utils/api';
 import { Button } from '@/components/common/Button';
@@ -9,7 +9,14 @@ import { Badge } from '@/components/common/Badge';
 import { Dialog, AlertDialog } from '@/components/common/Dialog';
 import { Plus, Trash2, Upload, Download, FileText, Loader2, Search, Settings, AlertTriangle, Eye, Edit2, Database, RefreshCw } from 'lucide-react';
 import { clsx } from 'clsx';
-import type { Collection, Document } from '@/types';
+import type { Collection, Document, SelectedDocumentFile } from '@/types';
+
+const processingStatuses = ['queued', 'validating', 'parsing', 'chunking', 'embedding', 'indexing'];
+
+const formatFileSize = (bytes: number) => {
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+};
 
 export const Knowledge = () => {
   const { user } = useAuthStore();
@@ -24,26 +31,28 @@ export const Knowledge = () => {
   const [newCollectionName, setNewCollectionName] = useState('');
   const [newCollectionDesc, setNewCollectionDesc] = useState('');
   const [selectedEmbeddingModel, setSelectedEmbeddingModel] = useState('');
-  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadFiles, setUploadFiles] = useState<SelectedDocumentFile[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [deletingCollectionId, setDeletingCollectionId] = useState<string | null>(null);
   const [showDeleteCollectionConfirm, setShowDeleteCollectionConfirm] = useState(false);
   const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
   const [showDeleteDocConfirm, setShowDeleteDocConfirm] = useState(false);
+  const collectionRequestRef = useRef(0);
 
   useEffect(() => {
     loadData();
   }, []);
 
   useEffect(() => {
-    if (!selectedCollection || !documents.some(doc =>
-      ['queued', 'validating', 'parsing', 'chunking', 'embedding', 'indexing'].includes(doc.status)
-    )) return;
-    const timer = window.setTimeout(() => handleSelectCollection(selectedCollection), 1000);
+    if (!selectedCollection || !documents.some(doc => processingStatuses.includes(doc.status))) return;
+    const timer = window.setTimeout(() => handleSelectCollection(selectedCollection), 2000);
     return () => window.clearTimeout(timer);
   }, [selectedCollection, documents]);
 
   const loadData = async () => {
+    setError(null);
     try {
       const [collectionsData, modelsData] = await Promise.all([
         nocaiAPI.knowledge.listCollections(),
@@ -56,40 +65,46 @@ export const Knowledge = () => {
       }
     } catch (error) {
       console.error('Failed to load knowledge:', error);
+      setError(error instanceof Error ? error.message : 'Could not load knowledge collections.');
     } finally {
       setLoading(false);
     }
   };
 
   const handleSelectCollection = async (collection: Collection) => {
+    const requestId = ++collectionRequestRef.current;
     setSelectedCollection(collection);
     setCollectionLoading(true);
     try {
       const docs = await nocaiAPI.knowledge.listDocuments(collection.id);
-      setDocuments(docs);
+      if (requestId === collectionRequestRef.current) setDocuments(docs);
     } catch (error) {
       console.error('Failed to load documents:', error);
+      if (requestId === collectionRequestRef.current) {
+        setError(error instanceof Error ? error.message : 'Could not load documents.');
+      }
     } finally {
-      setCollectionLoading(false);
+      if (requestId === collectionRequestRef.current) setCollectionLoading(false);
     }
   };
 
   const handleCreateCollection = async () => {
     if (!newCollectionName.trim() || !selectedEmbeddingModel) return;
+    setError(null);
     try {
       await nocaiAPI.knowledge.createCollection({
         name: newCollectionName.trim(),
         description: newCollectionDesc.trim() || undefined,
         embeddingModelId: selectedEmbeddingModel,
         embeddingConfig: {
-          chunkSize: 512,
+          chunkSize: 384,
           chunkOverlap: 50,
           topK: 10,
           hybridAlpha: 0.5,
           enableReranking: false,
         },
         chunkingConfig: {
-          chunkSize: 512,
+          chunkSize: 384,
           chunkOverlap: 50,
           minChunkSize: 50,
           respectBoundaries: true,
@@ -101,19 +116,51 @@ export const Knowledge = () => {
       await loadData();
     } catch (error) {
       console.error('Failed to create collection:', error);
+      setError(error instanceof Error ? error.message : 'Could not create the collection.');
     }
+  };
+
+  const addUploadFiles = (files: SelectedDocumentFile[]) => {
+    setUploadFiles((current) => {
+      const byPath = new Map(current.map((file) => [file.path, file]));
+      files.forEach((file) => byPath.set(file.path, file));
+      return [...byPath.values()];
+    });
+  };
+
+  const handleBrowseDocuments = async () => {
+    setUploadError(null);
+    try {
+      addUploadFiles(await nocaiAPI.knowledge.selectDocuments());
+    } catch (browseError) {
+      setUploadError(browseError instanceof Error ? browseError.message : 'Could not open the document picker.');
+    }
+  };
+
+  const handleDroppedFiles = (files: File[]) => {
+    const selected = files.flatMap((file) => {
+      const path = (file as File & { path?: string }).path;
+      return path ? [{ path, name: file.name, size: file.size }] : [];
+    });
+    if (!selected.length && files.length) {
+      setUploadError('Dropped file paths are unavailable. Use the file picker instead.');
+      return;
+    }
+    addUploadFiles(selected);
   };
 
   const handleUpload = async () => {
     if (uploadFiles.length === 0 || !selectedCollection) return;
     setUploading(true);
+    setUploadError(null);
     try {
-      await nocaiAPI.knowledge.uploadDocuments(selectedCollection.id, uploadFiles);
+      await nocaiAPI.knowledge.uploadDocuments(selectedCollection.id, uploadFiles.map((file) => file.path));
       setShowUploadDialog(false);
       setUploadFiles([]);
       await handleSelectCollection(selectedCollection);
     } catch (error) {
       console.error('Failed to upload:', error);
+      setUploadError(error instanceof Error ? error.message : 'Could not queue the selected documents.');
     } finally {
       setUploading(false);
     }
@@ -125,6 +172,7 @@ export const Knowledge = () => {
       await handleSelectCollection(selectedCollection!);
     } catch (error) {
       console.error('Failed to reprocess:', error);
+      setError(error instanceof Error ? error.message : 'Could not reprocess the document.');
     }
   };
 
@@ -134,6 +182,7 @@ export const Knowledge = () => {
       await handleSelectCollection(selectedCollection!);
     } catch (error) {
       console.error('Failed to delete document:', error);
+      setError(error instanceof Error ? error.message : 'Could not delete the document.');
     } finally {
       setShowDeleteDocConfirm(false);
       setDeletingDocId(null);
@@ -149,6 +198,7 @@ export const Knowledge = () => {
       }
     } catch (error) {
       console.error('Failed to delete collection:', error);
+      setError(error instanceof Error ? error.message : 'Could not delete the collection.');
     } finally {
       setShowDeleteCollectionConfirm(false);
       setDeletingCollectionId(null);
@@ -189,9 +239,19 @@ export const Knowledge = () => {
         </div>
       </div>
 
-      <div className="flex-1 flex overflow-hidden">
+      {error && (
+        <div className="mb-4 flex items-start justify-between gap-3 border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+          <div className="flex min-w-0 items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-none" />
+            <span>{error}</span>
+          </div>
+          <button type="button" onClick={() => setError(null)} className="flex-none font-medium hover:underline">Dismiss</button>
+        </div>
+      )}
+
+      <div className="flex flex-1 flex-col gap-4 overflow-hidden lg:flex-row">
         {/* Collections Sidebar */}
-        <Card className="w-80 flex-shrink-0 flex flex-col h-full">
+        <Card className="flex max-h-64 w-full flex-shrink-0 flex-col lg:h-full lg:max-h-none lg:w-80">
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2">
               <Database className="w-5 h-5" />
@@ -237,7 +297,7 @@ export const Knowledge = () => {
         </Card>
 
         {/* Documents Panel */}
-        <div className="flex-1 flex flex-col ml-4 min-w-0">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           {selectedCollection ? (
             <>
               <div className="flex items-center justify-between mb-4">
@@ -248,7 +308,7 @@ export const Knowledge = () => {
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button variant="outline" onClick={() => setShowUploadDialog(true)} disabled={!selectedCollection}>
+                  <Button variant="outline" onClick={() => { setUploadError(null); setShowUploadDialog(true); }} disabled={!selectedCollection}>
                     <Upload className="w-4 h-4 mr-2" />
                     Upload Documents
                   </Button>
@@ -268,8 +328,8 @@ export const Knowledge = () => {
                       </Button>
                     </div>
                   ) : (
-                    <div className="h-full overflow-y-auto">
-                      <table className="w-full">
+                    <div className="h-full overflow-auto">
+                      <table className="w-full min-w-[760px]">
                         <thead>
                           <tr className="border-b border-border">
                             <th className="px-4 py-3 text-left text-sm font-medium text-muted-foreground">Document</th>
@@ -289,21 +349,34 @@ export const Knowledge = () => {
                               </td>
                               <td className="px-4 py-3">
                                 <Badge variant={getStatusColor(doc.status)}>{doc.status}</Badge>
+                                {processingStatuses.includes(doc.status) && (
+                                  <div className="mt-2 w-32">
+                                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                                      <div
+                                        className="h-full rounded-full bg-primary transition-[width]"
+                                        style={{ width: `${Math.max(4, doc.ingestionProgress || 0)}%` }}
+                                      />
+                                    </div>
+                                    <p className="mt-1 text-xs text-muted-foreground">
+                                      {doc.ingestionStage || doc.status} {doc.ingestionProgress || 0}%
+                                    </p>
+                                  </div>
+                                )}
                                 {doc.errorMessage && (
                                   <p className="mt-1 max-w-xs text-xs text-destructive">{doc.errorMessage}</p>
                                 )}
                               </td>
                               <td className="px-4 py-3 text-sm text-muted-foreground">{doc.pageCount || '-'}</td>
                               <td className="px-4 py-3 text-sm text-muted-foreground">{doc.chunkCount}</td>
-                              <td className="px-4 py-3 text-sm text-muted-foreground">{(doc.sizeBytes / 1024).toFixed(1)} KB</td>
+                              <td className="px-4 py-3 text-sm text-muted-foreground">{formatFileSize(doc.sizeBytes)}</td>
                               <td className="px-4 py-3">
                                 <div className="flex items-center gap-1">
                                   {doc.status === 'failed' && (
-                                    <Button variant="ghost" size="sm" onClick={() => handleReprocess(doc.id)}>
+                                    <Button variant="ghost" size="sm" onClick={() => handleReprocess(doc.id)} aria-label={`Reprocess ${doc.originalFilename}`} title="Reprocess document">
                                       <RefreshCw className="w-4 h-4" />
                                     </Button>
                                   )}
-                                  <Button variant="ghost" size="sm" onClick={() => { setDeletingDocId(doc.id); setShowDeleteDocConfirm(true); }}>
+                                  <Button variant="ghost" size="sm" onClick={() => { setDeletingDocId(doc.id); setShowDeleteDocConfirm(true); }} aria-label={`Delete ${doc.originalFilename}`} title="Delete document">
                                     <Trash2 className="w-4 h-4" />
                                   </Button>
                                 </div>
@@ -366,48 +439,52 @@ export const Knowledge = () => {
       </Dialog>
 
       {/* Upload Documents Dialog */}
-      <Dialog open={showUploadDialog} onOpenChange={setShowUploadDialog} title="Upload Documents" description="Select files to add to the collection">
+      <Dialog
+        open={showUploadDialog}
+        onOpenChange={(open) => {
+          setShowUploadDialog(open);
+          if (!open) setUploadError(null);
+        }}
+        title="Upload Documents"
+        description="Queue local files for background indexing"
+      >
         <div className="space-y-4">
-          <div
-            className="border-2 border-dashed border-border rounded-lg p-8 text-center hover:border-primary/50 transition-colors"
-            onClick={() => document.getElementById('file-upload')?.click()}
+          <button
+            type="button"
+            className="w-full rounded-lg border-2 border-dashed border-border p-8 text-center transition-colors hover:border-primary/50 hover:bg-accent/30"
+            onClick={handleBrowseDocuments}
             onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('border-primary'); }}
             onDragLeave={(e) => { e.currentTarget.classList.remove('border-primary'); }}
             onDrop={(e) => {
               e.preventDefault();
               e.currentTarget.classList.remove('border-primary');
-              const files = Array.from(e.dataTransfer.files);
-              setUploadFiles(prev => [...prev, ...files]);
+              handleDroppedFiles(Array.from(e.dataTransfer.files));
             }}
           >
-            <input
-              id="file-upload"
-              type="file"
-              multiple
-              accept=".txt,.md,.pdf,.docx,.csv,.html"
-              onChange={(e) => {
-                const files = Array.from(e.target.files || []);
-                setUploadFiles(prev => [...prev, ...files]);
-              }}
-              className="hidden"
-            />
             <Upload className="w-12 h-12 text-muted-foreground/50 mx-auto mb-4" />
-            <p className="text-foreground">Drag & drop files here, or click to browse</p>
-            <p className="text-sm text-muted-foreground mt-1">Supported: .txt, .md, .pdf, .docx, .csv, .html</p>
-          </div>
+            <p className="text-foreground">Choose documents or drop them here</p>
+            <p className="text-sm text-muted-foreground mt-1">TXT, Markdown, PDF, DOCX, CSV, and HTML. Up to 512 MB each.</p>
+          </button>
+
+          {uploadError && (
+            <div className="flex items-start gap-2 border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+              <AlertTriangle className="mt-0.5 h-4 w-4 flex-none" />
+              <span>{uploadError}</span>
+            </div>
+          )}
 
           {uploadFiles.length > 0 && (
             <div className="max-h-64 overflow-y-auto space-y-2">
-              {uploadFiles.map((file, index) => (
-                <div key={index} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
-                  <div className="flex items-center gap-3">
+              {uploadFiles.map((file) => (
+                <div key={file.path} className="flex items-center justify-between gap-3 p-3 bg-muted/50 rounded-lg">
+                  <div className="flex min-w-0 items-center gap-3">
                     <FileText className="w-5 h-5 text-muted-foreground" />
-                    <div>
+                    <div className="min-w-0">
                       <p className="font-medium truncate max-w-[200px]">{file.name}</p>
-                      <p className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(1)} KB</p>
+                      <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
                     </div>
                   </div>
-                  <Button variant="ghost" size="sm" onClick={() => setUploadFiles(prev => prev.filter((_, i) => i !== index))}>
+                  <Button variant="ghost" size="sm" onClick={() => setUploadFiles(prev => prev.filter((item) => item.path !== file.path))} aria-label={`Remove ${file.name}`}>
                     <Trash2 className="w-4 h-4" />
                   </Button>
                 </div>
@@ -418,7 +495,11 @@ export const Knowledge = () => {
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={() => { setShowUploadDialog(false); setUploadFiles([]); }}>Cancel</Button>
             <Button onClick={handleUpload} disabled={uploadFiles.length === 0 || uploading || !selectedCollection} isLoading={uploading}>
-              {uploading ? 'Uploading...' : 'Upload Documents'}
+              {uploading
+                ? 'Queueing...'
+                : uploadFiles.length
+                  ? `Queue ${uploadFiles.length} document${uploadFiles.length === 1 ? '' : 's'}`
+                  : 'Queue documents'}
             </Button>
           </div>
         </div>

@@ -28,7 +28,7 @@ export const Dialog = ({ open, onOpenChange, title, description, children, class
       />
       <div
         className={clsx(
-          'relative z-50 w-full max-w-lg rounded-xl bg-card p-6 shadow-lg animate-in fade-in-0 zoom-in-95',
+          'relative z-50 w-[calc(100%-2rem)] max-w-lg rounded-lg border border-border bg-card p-6 shadow-lg animate-in fade-in-0 zoom-in-95',
           className
         )}
         onKeyDown={handleKeyDown}
@@ -68,7 +68,7 @@ export const AlertDialog = ({ open, onOpenChange, title, description, confirmTex
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center" role="alertdialog" aria-modal="true">
       <div className="fixed inset-0 bg-black/50 animate-in" onClick={() => onOpenChange(false)} />
-      <div className="relative z-50 w-full max-w-md rounded-xl bg-card p-6 shadow-lg animate-in fade-in-0 zoom-in-95">
+      <div className="relative z-50 w-[calc(100%-2rem)] max-w-md rounded-lg border border-border bg-card p-6 shadow-lg animate-in fade-in-0 zoom-in-95">
         <h2 className="text-lg font-semibold text-foreground mb-1">{title}</h2>
         {description && <p className="text-sm text-muted-foreground mb-6">{description}</p>}
         <div className="flex justify-end gap-3">

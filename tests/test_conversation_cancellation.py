@@ -4,8 +4,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 
-def test_conversation_create_list_rename_delete(tmp_path, monkeypatch):
-    """Conversation: create, list, rename, delete operations work."""
+def test_conversation_create_list_update_delete(tmp_path, monkeypatch):
+    """Conversation: create, list, preference updates, and delete operations work."""
     data_dir = tmp_path / "data"
     monkeypatch.setenv("NOC_AI_DATA_DIR", str(data_dir))
     monkeypatch.setenv("NOC_AI_MODELS_DIR", str(data_dir / "models"))
@@ -61,6 +61,77 @@ def test_conversation_create_list_rename_delete(tmp_path, monkeypatch):
             headers=headers,
         )
         assert rename.status_code == 200
+
+        # Persist the model and knowledge choices made in the chat header.
+        from backend.db.database import get_session_factory
+        from backend.db.models import Collection, Model
+
+        SessionLocal = get_session_factory(client.app.state.engine)
+        with SessionLocal() as db:
+            chat_model = Model(
+                id="active-chat-model",
+                name="Active Chat Model",
+                filename="chat.gguf",
+                filepath=str(data_dir / "models" / "chat.gguf"),
+                size_bytes=1024,
+                role="chat",
+                status="active",
+            )
+            embedding_model = Model(
+                id="active-embedding-model",
+                name="Active Embedding Model",
+                filename="embedding.gguf",
+                filepath=str(data_dir / "models" / "embedding.gguf"),
+                size_bytes=1024,
+                role="embedding",
+                status="active",
+            )
+            collection = Collection(
+                id="owned-collection",
+                name="Runbooks",
+                owner_id=login.json()["user"]["id"],
+                embedding_model_id=embedding_model.id,
+                embedding_config={},
+                chunking_config={},
+                status="active",
+            )
+            db.add_all([chat_model, embedding_model, collection])
+            db.commit()
+
+        update = client.patch(
+            f"/api/v1/chat/conversations/{conv_id}",
+            json={
+                "modelId": "active-chat-model",
+                "collectionId": "owned-collection",
+                "systemPrompt": "Prioritize operational safety.",
+                "temperature": 0.25,
+                "maxTokens": 2048,
+            },
+            headers=headers,
+        )
+        assert update.status_code == 200, update.text
+        assert update.json()["modelId"] == "active-chat-model"
+        assert update.json()["collectionId"] == "owned-collection"
+        assert update.json()["systemPrompt"] == "Prioritize operational safety."
+        assert update.json()["temperature"] == 0.25
+        assert update.json()["maxTokens"] == 2048
+
+        clear_collection = client.patch(
+            f"/api/v1/chat/conversations/{conv_id}",
+            json={"collectionId": None, "systemPrompt": None},
+            headers=headers,
+        )
+        assert clear_collection.status_code == 200
+        assert clear_collection.json()["collectionId"] is None
+        assert clear_collection.json()["systemPrompt"] is None
+
+        invalid_model = client.patch(
+            f"/api/v1/chat/conversations/{conv_id}",
+            json={"modelId": "missing-model"},
+            headers=headers,
+        )
+        assert invalid_model.status_code == 400
+        assert invalid_model.json()["detail"] == "Selected chat model is not active"
         
         # Delete conversation
         delete = client.delete(f"/api/v1/chat/conversations/{conv_id}", headers=headers)

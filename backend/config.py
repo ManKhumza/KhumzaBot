@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="NOC_AI_", extra="ignore")
     # App
     app_name: str = "NOC AI Assistant"
-    version: str = "1.0.1"
+    version: str = "1.0.2"
     debug: bool = False
     
     # Data directories
@@ -35,12 +35,14 @@ class Settings(BaseSettings):
     max_concurrent_generations: int = 1
     
     # Knowledge
-    default_chunk_size: int = 512
+    default_chunk_size: int = 384
     default_chunk_overlap: int = 50
     default_top_k: int = 10
     hybrid_alpha: float = 0.5
     enable_reranking: bool = False
     reranker_model_id: Optional[str] = None
+    max_document_size_mb: int = 512
+    ingestion_embedding_batch_size: int = 16
     
     # Security
     session_timeout_minutes: int = 480

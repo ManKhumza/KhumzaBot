@@ -1,7 +1,7 @@
 import importlib
 from pathlib import Path
 
-from backend.documents.chunking import ChunkConfig, chunk_text
+from backend.documents.chunking import ChunkConfig, chunk_text, iter_text_chunks
 
 
 def test_every_source_backend_module_imports():
@@ -28,3 +28,44 @@ def test_short_document_is_not_silently_discarded():
     chunks = chunk_text(text, ChunkConfig(min_chunk_size=50))
     assert len(chunks) == 1
     assert chunks[0].content == text
+
+
+def test_large_single_line_document_stays_within_chunk_budget():
+    text = "Interface Gi0/1 changed state to down. " * 50_000
+    chunks = chunk_text(
+        text,
+        ChunkConfig(chunk_size=256, chunk_overlap=32, min_chunk_size=20),
+    )
+
+    assert len(chunks) > 500
+    assert all(0 < chunk.token_count <= 256 for chunk in chunks)
+    assert all(chunk.content for chunk in chunks)
+
+
+def test_large_document_chunk_iterator_is_lazy():
+    text = "show interface counters\n" * 100_000
+    iterator = iter_text_chunks(text, ChunkConfig(chunk_size=128, chunk_overlap=16))
+
+    first = next(iterator)
+    assert first.token_count <= 128
+    assert not isinstance(iterator, list)
+
+
+def test_sparse_model_compatibility_is_normalized():
+    from datetime import datetime
+
+    from backend.db.models import Model
+    from backend.models.routes import model_to_response
+
+    model = Model(
+        id="embedding", name="Bundled embedding", filename="embedding.gguf",
+        filepath="embedding.gguf", format="GGUF", size_bytes=1024,
+        context_length=512, role="embedding", status="imported",
+        hardware_compatibility={"cpu": True},
+        model_metadata={}, imported_at=datetime.utcnow(),
+    )
+    compatibility = model_to_response(model).hardwareCompatibility
+
+    assert compatibility["status"] == "COMPATIBLE"
+    assert compatibility["warnings"] == []
+    assert compatibility["reasons"] == []

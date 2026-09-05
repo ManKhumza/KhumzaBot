@@ -5,6 +5,7 @@ import type {
   Collection,
   Document,
   Conversation,
+  ConversationUpdate,
   Message,
   Citation,
   SearchResult,
@@ -20,6 +21,7 @@ import type {
   BackupOptions,
   BackupResult,
   RestoreResult,
+  SelectedDocumentFile,
 } from '@/types';
 
 // IPC API types exposed by preload
@@ -28,6 +30,7 @@ declare global {
     nocai: {
       // Auth
       auth: {
+        getStatus: () => Promise<{ needsSetup: boolean }>;
         login: (credentials: { username: string; password: string }) => Promise<{ user: User; token: string; expiresAt: string }>;
         logout: () => Promise<void>;
         getSession: () => Promise<Session | null>;
@@ -39,6 +42,7 @@ declare global {
         createConversation: (title?: string) => Promise<Conversation>;
         deleteConversation: (id: string) => Promise<void>;
         renameConversation: (id: string, title: string) => Promise<void>;
+        updateConversation: (id: string, updates: ConversationUpdate) => Promise<Conversation>;
         getMessages: (conversationId: string, limit?: number, offset?: number) => Promise<Message[]>;
         sendMessage: (request: ChatRequest) => Promise<{
           id: string;
@@ -65,7 +69,8 @@ declare global {
         listCollections: () => Promise<Collection[]>;
         createCollection: (req: CreateCollectionRequest) => Promise<Collection>;
         deleteCollection: (id: string) => Promise<void>;
-        uploadDocuments: (collectionId: string, files: File[]) => Promise<Document[]>;
+        selectDocuments: () => Promise<SelectedDocumentFile[]>;
+        uploadDocuments: (collectionId: string, filePaths: string[]) => Promise<Document[]>;
         listDocuments: (collectionId: string) => Promise<Document[]>;
         deleteDocument: (id: string) => Promise<void>;
         reprocessDocument: (id: string) => Promise<void>;
@@ -259,6 +264,10 @@ class NocAIAPI {
 
   // Auth
   auth = {
+    getStatus: async () => {
+      await this.ensureReady();
+      return window.nocai.auth.getStatus();
+    },
     login: async (credentials: { username: string; password: string }) => {
       await this.ensureReady();
       return window.nocai.auth.login(credentials);
@@ -294,6 +303,10 @@ class NocAIAPI {
     renameConversation: async (id: string, title: string) => {
       await this.ensureReady();
       return window.nocai.chat.renameConversation(id, title);
+    },
+    updateConversation: async (id: string, updates: ConversationUpdate) => {
+      await this.ensureReady();
+      return window.nocai.chat.updateConversation(id, updates);
     },
     getMessages: async (conversationId: string, limit?: number, offset?: number) => {
       await this.ensureReady();
@@ -368,9 +381,13 @@ class NocAIAPI {
         await this.ensureReady();
         return window.nocai.knowledge.deleteCollection(id);
       },
-      uploadDocuments: async (collectionId: string, files: File[]) => {
+      selectDocuments: async () => {
         await this.ensureReady();
-        return window.nocai.knowledge.uploadDocuments(collectionId, files);
+        return window.nocai.knowledge.selectDocuments();
+      },
+      uploadDocuments: async (collectionId: string, filePaths: string[]) => {
+        await this.ensureReady();
+        return window.nocai.knowledge.uploadDocuments(collectionId, filePaths);
       },
       listDocuments: async (collectionId: string) => {
         await this.ensureReady();

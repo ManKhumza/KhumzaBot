@@ -372,6 +372,7 @@ const ModelCard = ({ model, hardware, onActivate, onDeactivate, onDelete, activa
   activating: boolean;
 }) => {
   const compat = model.hardwareCompatibility;
+  const compatibilityWarnings = Array.isArray(compat?.warnings) ? compat.warnings : [];
   const compatColor = compat?.status ? 
     (compat.status === 'RECOMMENDED' ? 'success' : 
      compat.status === 'COMPATIBLE' ? 'default' :
@@ -418,7 +419,7 @@ const ModelCard = ({ model, hardware, onActivate, onDeactivate, onDelete, activa
           </div>
         </div>
 
-        {compat && (
+        {compat?.status && (
           <div className="p-3 rounded-lg bg-muted/50">
             <div className="flex items-center justify-between mb-2">
               <span className="font-medium">Compatibility</span>
@@ -430,9 +431,9 @@ const ModelCard = ({ model, hardware, onActivate, onDeactivate, onDelete, activa
                 <> | Est. VRAM: {compat.estimatedVramMB.toFixed(0)} MB</>
               )}
             </div>
-            {compat.warnings.length > 0 && (
+            {compatibilityWarnings.length > 0 && (
               <div className="mt-2 text-xs text-destructive">
-                {compat.warnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
+                {compatibilityWarnings.map((warning, index) => <div key={index}>{warning}</div>)}
               </div>
             )}
           </div>
@@ -450,7 +451,7 @@ const ModelCard = ({ model, hardware, onActivate, onDeactivate, onDelete, activa
             </Button>
           )}
         </div>
-        <Button variant="ghost" size="sm" onClick={onDelete} className="text-destructive hover:text-destructive">
+        <Button variant="ghost" size="sm" onClick={onDelete} className="text-destructive hover:text-destructive" aria-label={`Delete ${model.name}`} title="Delete model">
           <Trash2 className="w-4 h-4" />
         </Button>
       </CardFooter>

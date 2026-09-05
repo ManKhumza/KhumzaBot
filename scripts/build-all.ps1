@@ -2,7 +2,7 @@
 <# Build and package NOC AI Assistant for Windows x64. #>
 
 param(
-    [string]$Version = "1.0.1",
+    [string]$Version = "1.0.2",
     [switch]$SkipBackend,
     [switch]$SkipFrontend,
     [switch]$SkipRuntime,
@@ -45,6 +45,14 @@ if (-not $SkipFrontend) {
         Invoke-Checked "npm.cmd" @("run", "typecheck")
         Invoke-Checked "npm.cmd" @("run", "build")
     } finally { Pop-Location }
+}
+
+if (-not $SkipPackaging -and (Test-Path -LiteralPath $ReleaseDir)) {
+    $ResolvedReleaseDir = (Resolve-Path -LiteralPath $ReleaseDir).Path
+    if (-not $ResolvedReleaseDir.StartsWith($ElectronDir + [System.IO.Path]::DirectorySeparatorChar)) {
+        throw "Release output must remain inside the Electron project."
+    }
+    Remove-Item -LiteralPath $ResolvedReleaseDir -Recurse -Force
 }
 
 Push-Location $ElectronDir

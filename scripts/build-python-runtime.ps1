@@ -15,11 +15,12 @@ if (-not $OutputPath.StartsWith($ProjectRoot + [System.IO.Path]::DirectorySepara
 
 $VirtualPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $VirtualPython)) { throw "Create the project .venv before building the Python runtime." }
+$EmbeddedPython = Join-Path $OutputPath "python.exe"
 
 $Marker = Join-Path $OutputPath "NOC_AI_RUNTIME_VERSION"
 $NeedsBootstrap = $true
 if ((Test-Path $Marker) -and ((Get-Content $Marker -Raw).Trim() -eq $PythonVersion)) {
-    & (Join-Path $OutputPath "python.exe") -c "import backend.main"
+    & $EmbeddedPython -c "import backend.main"
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Portable Python $PythonVersion base runtime is already installed; refreshing application code." -ForegroundColor Green
         $NeedsBootstrap = $false
@@ -42,10 +43,29 @@ if ($NeedsBootstrap) {
 }
 
 $SitePackages = Join-Path $OutputPath "Lib\site-packages"
+if (Test-Path -LiteralPath $SitePackages) {
+    Remove-Item -LiteralPath $SitePackages -Recurse -Force
+}
 New-Item -ItemType Directory -Path $SitePackages -Force | Out-Null
-& $VirtualPython -m pip install --disable-pip-version-check --no-compile --upgrade --target $SitePackages (Join-Path $ProjectRoot "backend")
-if ($LASTEXITCODE -ne 0) { throw "Installing backend runtime dependencies failed." }
+$WheelDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "nocai-backend-wheel-$PID"
+New-Item -ItemType Directory -Path $WheelDirectory -Force | Out-Null
+try {
+    # Build local source with the development interpreter, then resolve all native
+    # dependencies for the embedded interpreter's ABI.
+    & $VirtualPython -m pip wheel --disable-pip-version-check --no-deps --wheel-dir $WheelDirectory (Join-Path $ProjectRoot "backend")
+    if ($LASTEXITCODE -ne 0) { throw "Building the backend runtime wheel failed." }
+    $BackendWheel = Get-ChildItem -LiteralPath $WheelDirectory -Filter "noc_ai_backend-*.whl" | Select-Object -First 1
+    if (-not $BackendWheel) { throw "The backend runtime wheel was not produced." }
+
+    # Without --python, a newer host Python can silently install incompatible ABI wheels.
+    & $VirtualPython -m pip --python $EmbeddedPython install --disable-pip-version-check --no-compile --upgrade --target $SitePackages $BackendWheel.FullName
+    if ($LASTEXITCODE -ne 0) { throw "Installing backend runtime dependencies failed." }
+} finally {
+    if (Test-Path -LiteralPath $WheelDirectory) {
+        Remove-Item -LiteralPath $WheelDirectory -Recurse -Force
+    }
+}
 
 Set-Content -LiteralPath $Marker -Value $PythonVersion -Encoding ascii
-& (Join-Path $OutputPath "python.exe") -c "import backend.main; print('portable backend import OK')"
+& $EmbeddedPython -c "import backend.main; print('portable backend import OK')"
 if ($LASTEXITCODE -ne 0) { throw "Portable backend runtime validation failed." }

@@ -474,7 +474,7 @@ Remove-Item "apps/desktop/electron/node_modules" -Recurse -Force
 ### Updating Version
 ```powershell
 # Update all package.json files
-$version = "1.0.1"
+$version = "1.0.2"
 
 # Root (if exists)
 # Apps/desktop/renderer/package.json

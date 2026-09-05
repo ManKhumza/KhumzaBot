@@ -60,7 +60,10 @@ class ChatRequest(BaseModel):
     maxTokens: Optional[int] = Field(None, ge=1, le=32768)
 
 class UpdateConversationRequest(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    modelId: Optional[str] = None
+    collectionId: Optional[str] = None
+    systemPrompt: Optional[str] = Field(None, max_length=20000)
     temperature: Optional[float] = Field(None, ge=0, le=2)
     maxTokens: Optional[int] = Field(None, ge=1, le=32768)
 
@@ -175,7 +178,7 @@ async def delete_conversation(
     db.commit()
     return {"success": True}
 
-@router.patch("/conversations/{conversation_id}")
+@router.patch("/conversations/{conversation_id}", response_model=ConversationResponse)
 async def update_conversation(
     conversation_id: str,
     request: UpdateConversationRequest,
@@ -189,13 +192,40 @@ async def update_conversation(
     if not conversation:
         raise HTTPException(404, "Conversation not found")
     
-    conversation.title = request.title
+    if request.title is not None:
+        conversation.title = request.title
+
+    if "modelId" in request.model_fields_set:
+        if request.modelId is not None:
+            model = db.query(Model).filter(
+                Model.id == request.modelId,
+                Model.role == "chat",
+                Model.status == "active",
+            ).first()
+            if model is None:
+                raise HTTPException(400, "Selected chat model is not active")
+        conversation.model_id = request.modelId
+
+    if "collectionId" in request.model_fields_set:
+        if request.collectionId is not None:
+            collection = db.query(Collection).filter(
+                Collection.id == request.collectionId,
+                Collection.owner_id == current_user.id,
+                Collection.status == "active",
+            ).first()
+            if collection is None:
+                raise HTTPException(404, "Knowledge collection not found")
+        conversation.collection_id = request.collectionId
+
+    if "systemPrompt" in request.model_fields_set:
+        conversation.system_prompt = request.systemPrompt
     if request.temperature is not None:
         conversation.temperature = round(request.temperature * 100)
     if request.maxTokens is not None:
         conversation.max_tokens = request.maxTokens
     
     db.commit()
+    db.refresh(conversation)
     return conversation_to_response(conversation)
 
 @router.get("/conversations/{conversation_id}/messages", response_model=List[MessageResponse])
