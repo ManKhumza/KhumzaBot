@@ -25,6 +25,7 @@ from backend.auth.routes import router as auth_router
 from backend.auth.dependencies import set_session_token
 from backend.chat.routes import router as chat_router
 from backend.models.routes import router as models_router
+from backend.inference.routes import router as inference_router
 from backend.knowledge.routes import router as knowledge_router
 from backend.admin.routes import router as admin_router
 from backend.health.routes import router as health_router
@@ -170,7 +171,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="NOC AI Assistant API",
-        version="1.0.2",
+        version="1.0.3",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -220,6 +221,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(chat_router, prefix="/api/v1/chat", tags=["chat"])
     app.include_router(models_router, prefix="/api/v1/models", tags=["models"])
+    app.include_router(inference_router, prefix="/api/v1/inference", tags=["inference"])
     app.include_router(knowledge_router, prefix="/api/v1/knowledge", tags=["knowledge"])
     app.include_router(admin_router, prefix="/api/v1/admin", tags=["admin"])
     app.include_router(health_router, prefix="/health", tags=["health"])

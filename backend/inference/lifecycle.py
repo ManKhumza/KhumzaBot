@@ -1,45 +1,91 @@
+"""
+Model lifecycle manager – spawns and supervises llama-server processes.
+
+Each GGUF model (chat or embedding) runs as an independent HTTP server.
+The FastAPI backend proxies inference requests to the appropriate server.
+
+This replaces the previous approach of piping stdin/stdout to the llama
+CLI binary, which caused pipe deadlocks and orphaned processes.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import subprocess
-import httpx
-import os
 import logging
-import secrets
 import math
-from dataclasses import dataclass, field
-from typing import Optional, Dict
+import secrets
+import shutil
+import time
+from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-from backend.config import Settings
-from backend.db.models import Model
+import httpx
 
-logger = logging.getLogger(__name__)
+from backend.inference.port_pool import PortPool
+
+logger = logging.getLogger("nocai.inference")
+
+# Bounded ring buffer size for captured stdout / stderr lines.
+# Prevents unbounded memory growth while retaining enough history
+# for meaningful diagnostics.
+_LOG_RING_SIZE = 200
+
+
+class LlamaServerError(RuntimeError):
+    """Raised when a llama-server process fails to start or dies unexpectedly."""
 
 
 class EmbeddingInputTooLong(RuntimeError):
-    pass
+    """Raised when llama-server rejects an embedding input as too large."""
+
 
 class ModelStatus(str):
     NOT_LOADED = "not_loaded"
     STARTING = "starting"
     READY = "ready"
-    BUSY = "busy"
     STOPPING = "stopping"
     FAILED = "failed"
 
+
+def _model_identity(model: Any) -> str:
+    return " ".join(
+        str(getattr(model, field_name, "") or "")
+        for field_name in ("name", "filename", "architecture")
+    ).casefold()
+
+
+def _role_specific_runtime_args(model: Any, role: str) -> list[str]:
+    """Return model-family flags needed for responsive local inference."""
+    if role == "chat" and "qwen3" in _model_identity(model).replace("-", ""):
+        return ["--reasoning", "off"]
+    return []
+
+
 @dataclass
 class ModelProvider:
+    """Compatibility facade used by chat and document services."""
+
     model_id: str
     role: str
-    process: Optional[subprocess.Popen] = None
-    port: Optional[int] = None
-    client: Optional[httpx.AsyncClient] = None
+    process: Any = None
+    port: int | None = None
+    client: Any = None
     status: str = ModelStatus.NOT_LOADED
     stderr_tail: list[str] = field(default_factory=list)
     api_key: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
+    query_prefix: str = ""
 
     async def embed_single(self, text: str) -> list[float]:
-        embeddings = await self.embed_batch([text])
-        return embeddings[0]
+        return (await self.embed_batch([text]))[0]
+
+    async def embed_query(self, text: str) -> list[float]:
+        prepared = text
+        if self.query_prefix and not text.startswith(self.query_prefix):
+            prepared = f"{self.query_prefix}{text}"
+        return (await self.embed_batch([prepared]))[0]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -47,32 +93,28 @@ class ModelProvider:
         try:
             return await self._request_embeddings(texts)
         except EmbeddingInputTooLong:
-            logger.warning(
-                "Embedding batch exceeded the model token window; splitting %d inputs",
-                len(texts),
+            return list(
+                await asyncio.gather(
+                    *(self._embed_with_splitting(text) for text in texts)
+                )
             )
-            return list(await asyncio.gather(*(self._embed_with_splitting(text) for text in texts)))
 
     async def _request_embeddings(self, texts: list[str]) -> list[list[float]]:
-        if not self.client:
+        if self.client is None:
             raise RuntimeError("Embedding runtime is not ready")
-        response = await self.client.post(
-            "/v1/embeddings",
-            json={"input": texts},
-        )
-        if response.status_code >= 400:
-            detail = response.text.lower()
-            if any(fragment in detail for fragment in (
+        response = await self.client.post("/v1/embeddings", json={"input": texts})
+        if response.status_code >= 400 and any(
+            fragment in response.text.lower()
+            for fragment in (
                 "too large to process",
                 "physical batch size",
                 "context size",
                 "context window",
-            )):
-                raise EmbeddingInputTooLong(response.text)
+            )
+        ):
+            raise EmbeddingInputTooLong(response.text)
         response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data") or []
-        ordered = sorted(data, key=lambda item: item.get("index", 0))
+        ordered = sorted(response.json().get("data") or [], key=lambda item: item.get("index", 0))
         embeddings = [item.get("embedding") for item in ordered]
         if len(embeddings) != len(texts) or any(not vector for vector in embeddings):
             raise RuntimeError(
@@ -85,27 +127,33 @@ class ModelProvider:
             return (await self._request_embeddings([text]))[0]
         except EmbeddingInputTooLong:
             if depth >= 12 or len(text) < 2:
-                raise RuntimeError("A document chunk could not fit in the embedding model context")
+                raise RuntimeError(
+                    "A document chunk could not fit in the embedding model context"
+                )
 
         midpoint = len(text) // 2
         lower_bound = max(1, len(text) // 4)
         upper_bound = min(len(text) - 1, len(text) * 3 // 4)
-        left_space = text.rfind(" ", lower_bound, midpoint + 1)
-        right_space = text.find(" ", midpoint, upper_bound)
-        candidates = [index for index in (left_space, right_space) if index > 0]
+        candidates = [
+            index
+            for index in (
+                text.rfind(" ", lower_bound, midpoint + 1),
+                text.find(" ", midpoint, upper_bound),
+            )
+            if index > 0
+        ]
         split_at = min(candidates, key=lambda index: abs(index - midpoint)) if candidates else midpoint
-        left = text[:split_at].strip()
-        right = text[split_at:].strip()
+        left, right = text[:split_at].strip(), text[split_at:].strip()
         if not left or not right:
             left, right = text[:midpoint], text[midpoint:]
 
-        left_vector = await self._embed_with_splitting(left, depth + 1)
-        right_vector = await self._embed_with_splitting(right, depth + 1)
+        left_vector, right_vector = await asyncio.gather(
+            self._embed_with_splitting(left, depth + 1),
+            self._embed_with_splitting(right, depth + 1),
+        )
         if len(left_vector) != len(right_vector):
             raise RuntimeError("Embedding runtime returned inconsistent vector dimensions")
-
-        left_weight = max(1, len(left))
-        right_weight = max(1, len(right))
+        left_weight, right_weight = max(1, len(left)), max(1, len(right))
         total_weight = left_weight + right_weight
         combined = [
             (left_value * left_weight + right_value * right_weight) / total_weight
@@ -116,243 +164,506 @@ class ModelProvider:
             raise RuntimeError("Embedding runtime returned an empty or non-finite vector")
         return [value / norm for value in combined]
 
+
+class LlamaServerProcess:
+    """Manages a single llama.cpp HTTP server instance.
+
+    Lifecycle:
+        server = LlamaServerProcess(model_path, port, binary_path)
+        await server.start()       # spawn + wait for /health
+        healthy = await server.is_healthy()
+        await server.stop()        # graceful SIGTERM → SIGKILL
+    """
+
+    def __init__(
+        self,
+        model_path: Path,
+        port: int,
+        binary_path: Path,
+        *,
+        ctx_size: int = 4096,
+        gpu_layers: int = 99,
+        threads: int = 0,
+        role: str = "chat",
+        api_key: str | None = None,
+        extra_args: list[str] | None = None,
+        host: str = "127.0.0.1",
+        health_timeout: float = 60.0,
+    ) -> None:
+        self.model_path = Path(model_path)
+        self.port = port
+        self.binary_path = Path(binary_path)
+        self.ctx_size = ctx_size
+        self.gpu_layers = gpu_layers
+        self.threads = threads
+        self.role = role
+        self.api_key = api_key or secrets.token_urlsafe(32)
+        self.extra_args = list(extra_args or [])
+        self.host = host
+        self.health_timeout = health_timeout
+
+        self.process: asyncio.subprocess.Process | None = None
+        self._stdout_ring: deque[str] = deque(maxlen=_LOG_RING_SIZE)
+        self._stderr_ring: deque[str] = deque(maxlen=_LOG_RING_SIZE)
+        self._drain_tasks: list[asyncio.Task] = []
+        self._started_at: float | None = None
+
+    # ── lifecycle ──────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Spawn llama-server and block until /health returns 200."""
+        if self.process is not None and self.process.returncode is None:
+            logger.warning(
+                "llama-server already running on port %s, skipping start",
+                self.port,
+            )
+            return
+
+        if not self.binary_path.is_file():
+            raise LlamaServerError(
+                f"llama-server binary not found: {self.binary_path}"
+            )
+
+        if not self.model_path.is_file():
+            raise LlamaServerError(
+                f"Model file not found: {self.model_path}"
+            )
+
+        cmd = [
+            str(self.binary_path),
+            "--model", str(self.model_path),
+            "--host", self.host,
+            "--port", str(self.port),
+            "--ctx-size", str(self.ctx_size),
+            "--n-gpu-layers", str(self.gpu_layers),
+            "--threads", str(self.threads),
+            "--api-key", self.api_key,
+            "--no-webui",
+            "--log-disable",
+        ]
+
+        if self.role == "embedding":
+            cmd.extend(["--embedding", "--pooling", "cls"])
+        cmd.extend(self.extra_args)
+
+        logger.info(
+            "Starting llama-server on %s:%s for %s model %s",
+            self.host,
+            self.port,
+            self.role,
+            self.model_path.name,
+        )
+
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Background tasks to continuously drain stdout/stderr so the
+        # OS pipe buffers never fill up and block the child process.
+        self._drain_tasks = [
+            asyncio.create_task(
+                self._drain_stream(self.process.stdout, self._stdout_ring),
+                name=f"drain-stdout-{self.port}",
+            ),
+            asyncio.create_task(
+                self._drain_stream(self.process.stderr, self._stderr_ring),
+                name=f"drain-stderr-{self.port}",
+            ),
+        ]
+
+        try:
+            await self._wait_for_ready()
+        except Exception:
+            # Startup failed — clean up the process we just spawned
+            await self._force_kill()
+            raise
+
+        self._started_at = time.monotonic()
+        logger.info(
+            "llama-server ready on port %s (model: %s)",
+            self.port,
+            self.model_path.name,
+        )
+
+    async def stop(self, timeout: float = 10.0) -> None:
+        """Gracefully stop the server. SIGTERM first, SIGKILL after timeout."""
+        # Cancel drain tasks first
+        for task in self._drain_tasks:
+            task.cancel()
+        self._drain_tasks.clear()
+
+        if self.process is None or self.process.returncode is not None:
+            self.process = None
+            return
+
+        logger.info("Stopping llama-server on port %s", self.port)
+
+        try:
+            self.process.terminate()
+            await asyncio.wait_for(self.process.wait(), timeout=timeout)
+            logger.info(
+                "llama-server on port %s exited with code %s",
+                self.port,
+                self.process.returncode,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "llama-server on port %s did not exit after %.1fs SIGTERM; "
+                "sending SIGKILL",
+                self.port,
+                timeout,
+            )
+            self.process.kill()
+            await self.process.wait()
+
+        self.process = None
+
+    # ── health ─────────────────────────────────────────────────
+
+    async def is_healthy(self) -> bool:
+        """Check whether the server's /health endpoint responds 200."""
+        if not self.is_running:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(
+                    f"http://{self.host}:{self.port}/health",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                return resp.status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    # ── diagnostics ────────────────────────────────────────────
+
+    @property
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.returncode is None
+
+    @property
+    def exit_code(self) -> int | None:
+        if self.process is None:
+            return None
+        return self.process.returncode
+
+    def poll(self) -> int | None:
+        """Expose subprocess-style status for existing health consumers."""
+        return self.exit_code
+
+    @property
+    def recent_stderr(self) -> str:
+        return "\n".join(self._stderr_ring)
+
+    @property
+    def recent_stdout(self) -> str:
+        return "\n".join(self._stdout_ring)
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a JSON-serialisable snapshot of this server's state."""
+        return {
+            "model": self.model_path.name,
+            "port": self.port,
+            "running": self.is_running,
+            "exit_code": self.exit_code,
+            "uptime_seconds": (
+                round(time.monotonic() - self._started_at, 1)
+                if self._started_at is not None
+                else None
+            ),
+            "stderr_tail": list(self._stderr_ring)[-10:],
+            "stdout_tail": list(self._stdout_ring)[-10:],
+        }
+
+    # ── internals ──────────────────────────────────────────────
+
+    async def _wait_for_ready(self) -> None:
+        """Poll /health until the server responds or we hit the timeout."""
+        deadline = time.monotonic() + self.health_timeout
+        url = f"http://{self.host}:{self.port}/health"
+
+        async with httpx.AsyncClient() as client:
+            while time.monotonic() < deadline:
+                # If the process already exited, fail fast
+                if self.process is not None and self.process.returncode is not None:
+                    raise LlamaServerError(
+                        f"llama-server exited with code "
+                        f"{self.process.returncode} during startup. "
+                        f"stderr tail: {self.recent_stderr[:500]}"
+                    )
+                try:
+                    resp = await client.get(
+                        url,
+                        timeout=2.0,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                    )
+                    if resp.status_code == 200:
+                        return
+                except httpx.HTTPError:
+                    pass  # Server not ready yet, keep polling
+                await asyncio.sleep(0.5)
+
+        raise LlamaServerError(
+            f"llama-server on port {self.port} did not become healthy "
+            f"within {self.health_timeout}s. "
+            f"stderr tail: {self.recent_stderr[:500]}"
+        )
+
+    async def _force_kill(self) -> None:
+        """Kill the process and cancel drain tasks. Used on startup failure."""
+        for task in self._drain_tasks:
+            task.cancel()
+        self._drain_tasks.clear()
+
+        if self.process is not None and self.process.returncode is None:
+            self.process.kill()
+            await self.process.wait()
+        self.process = None
+
+    @staticmethod
+    async def _drain_stream(
+        stream: asyncio.StreamReader | None,
+        ring: deque[str],
+    ) -> None:
+        """Read lines from a stream into a bounded ring buffer.
+
+        This prevents the OS pipe buffer from filling up and blocking
+        the child process (the root cause of the previous deadlocks).
+        """
+        if stream is None:
+            return
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                ring.append(line.decode(errors="replace").rstrip())
+        except asyncio.CancelledError:
+            pass
+
+
 class ModelLifecycleManager:
-    def __init__(self, settings: Settings):
+    """Supervises all llama-server instances for the application.
+
+    This class is instantiated by backend/main.py and stored as
+    app.state.model_manager. The constructor signature and the
+    startup/shutdown methods MUST remain compatible with main.py.
+    """
+
+    def __init__(self, settings: Any) -> None:
         self.settings = settings
-        self.chat_provider: Optional[ModelProvider] = None
-        self.embedding_provider: Optional[ModelProvider] = None
-        self.active_chat_model_id: Optional[str] = None
-        self.active_embedding_model_id: Optional[str] = None
-        self._status_callbacks: list = []
+        self._servers: dict[str, LlamaServerProcess] = {}
+        self._port_pool = PortPool(
+            start=getattr(settings, "inference_port_start", 8100),
+            end=getattr(settings, "inference_port_end", 8200),
+        )
+        # Binary resolution is intentionally lazy: the backend remains usable
+        # for administration when no inference runtime is installed or active.
+        self._binary_path: Path | None = None
+        self.chat_provider: ModelProvider | None = None
+        self.embedding_provider: ModelProvider | None = None
+        self.active_chat_model_id: str | None = None
+        self.active_embedding_model_id: str | None = None
+        self._status_callbacks: list[Any] = []
         self._generation_count = 0
         self._generation_lock = asyncio.Lock()
-    
-    def on_status_change(self, callback):
-        self._status_callbacks.append(callback)
-    
-    def _notify_status(self, model_id: str, status: str, role: str):
-        for cb in self._status_callbacks:
-            try:
-                cb(model_id, status, role)
-            except Exception as e:
-                logger.error(f"Status callback error: {e}")
-    
-    async def startup(self, session_factory=None):
-        """Reconcile persisted active flags with real runtime processes."""
-        if session_factory is None:
-            return
-        with session_factory() as db:
-            active_models = db.query(Model).filter(Model.status == "active").all()
-            for model in active_models:
-                if model.role not in ("chat", "embedding"):
-                    model.status = "imported"
+
+    # ── public API (called by main.py lifespan) ────────────────
+
+    async def startup(self, session_factory: Any) -> None:
+        """Reconcile DB state with running processes on app launch.
+
+        Called once during FastAPI lifespan startup. Queries the database
+        for models marked 'active' and attempts to load each one.
+        Models that fail to load are marked 'error' in the database.
+        """
+        from backend.db.models import Model
+
+        SessionLocal = session_factory
+        with SessionLocal() as db:
+            active_ids = [
+                model.id
+                for model in db.query(Model).filter(Model.status == "active").all()
+            ]
+
+        for model_id in active_ids:
+            with SessionLocal() as db:
+                model = db.query(Model).filter(Model.id == model_id).first()
+                if model is None:
                     continue
                 try:
                     await self.load_model(model, model.role)
                     model.validation_error = None
                 except Exception as exc:
-                    logger.exception("Could not restore active %s model %s", model.role, model.id)
+                    logger.exception("Failed to restore active model %s", model_id)
                     model.status = "error"
                     model.validation_error = str(exc)[:2000]
-            db.commit()
-    
-    async def shutdown(self):
-        await self.unload_model("chat")
-        await self.unload_model("embedding")
-    
-    async def load_model(self, model: Model, role: str, config: dict = None) -> ModelProvider:
-        if model.role != role:
+                db.commit()
+
+    async def shutdown(self) -> None:
+        """Stop every managed llama-server. Called during app shutdown."""
+        if not self._servers:
+            logger.info("No inference servers to stop")
+            return
+
+        logger.info("Stopping %d inference server(s)", len(self._servers))
+        model_ids = list(self._servers)
+        tasks = [self.unload_model(mid) for mid in model_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for mid, result in zip(model_ids, results):
+            if isinstance(result, Exception):
+                logger.error("Error stopping server %s: %s", mid, result)
+
+        logger.info("All inference servers stopped")
+
+    # ── model management ───────────────────────────────────────
+
+    async def load_model(
+        self, model: Any, role: str, config: dict[str, Any] | None = None
+    ) -> ModelProvider:
+        """Load a model through an authenticated llama-server HTTP process."""
+        if not hasattr(model, "id"):
+            raise TypeError("load_model requires a Model instance")
+        if role not in ("chat", "embedding") or model.role != role:
             raise ValueError(f"Model {model.id} is not a {role} model")
-        
-        if role == "chat" and self.active_chat_model_id == model.id and self.chat_provider:
-            return self.chat_provider
-        if role == "embedding" and self.active_embedding_model_id == model.id and self.embedding_provider:
-            return self.embedding_provider
-        
+
+        current = self.get_chat_provider() if role == "chat" else self.get_embedding_provider()
+        if current is not None and current.model_id == model.id and current.process.is_running:
+            return current
+
         await self.unload_model(role)
-        
-        provider = ModelProvider(model_id=model.id, role=role)
-        
+        model_path = Path(model.filepath)
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Model file missing on disk: {model_path}")
+        if self._binary_path is None:
+            self._binary_path = self._resolve_binary()
+
+        runtime_config = config or {}
+        port = self._port_pool.acquire(model.id)
+        identity = _model_identity(model)
+        query_prefix = (
+            "Represent this sentence for searching relevant passages: "
+            if role == "embedding" and ("bge-" in identity or "bge_" in identity)
+            else ""
+        )
+        provider = ModelProvider(
+            model_id=model.id,
+            role=role,
+            port=port,
+            status=ModelStatus.STARTING,
+            query_prefix=query_prefix,
+        )
         self._notify_status(model.id, ModelStatus.STARTING, role)
-        
+        server = LlamaServerProcess(
+            model_path=model_path,
+            port=port,
+            binary_path=self._binary_path,
+            ctx_size=runtime_config.get(
+                "context_length", getattr(model, "context_length", None) or 4096
+            ),
+            gpu_layers=runtime_config.get(
+                "gpu_layers", getattr(self.settings, "default_gpu_layers", -1)
+            ),
+            threads=runtime_config.get(
+                "threads", getattr(self.settings, "default_threads", 0)
+            ),
+            role=role,
+            api_key=provider.api_key,
+            extra_args=_role_specific_runtime_args(model, role),
+        )
+        provider.process = server
         try:
-            await self._start_llama_server(provider, model, config or {}, role)
-            
-            if role == "chat":
-                self.chat_provider = provider
-                self.active_chat_model_id = model.id
-            else:
-                self.embedding_provider = provider
-                self.active_embedding_model_id = model.id
-            
-            self._notify_status(model.id, ModelStatus.READY, role)
-            return provider
-            
-        except Exception as e:
+            await server.start()
+            provider.client = httpx.AsyncClient(
+                base_url=f"http://{server.host}:{server.port}",
+                timeout=httpx.Timeout(300.0, connect=10.0),
+                headers={"Authorization": f"Bearer {provider.api_key}"},
+            )
+        except Exception:
+            self._port_pool.release(port)
             provider.status = ModelStatus.FAILED
-            if provider.client:
-                await provider.client.aclose()
-                provider.client = None
-            if provider.process and provider.process.poll() is None:
-                provider.process.kill()
-                await asyncio.get_event_loop().run_in_executor(None, provider.process.wait)
             self._notify_status(model.id, ModelStatus.FAILED, role)
             raise
-    
-    async def _start_llama_server(self, provider: ModelProvider, model: Model, config: dict, role: str):
-        provider.port = await self._get_free_port()
-        base_url = f"http://127.0.0.1:{provider.port}"
-        
-        cmd = [
-            self.settings.llama_server_path,
-            "-m", model.filepath,
-            "-c", str(config.get("context_length", model.context_length or self.settings.default_context_length)),
-            "-t", str(config.get("threads", self.settings.default_threads)),
-            "-ngl", str(config.get("gpu_layers", self.settings.default_gpu_layers)),
-            "--port", str(provider.port),
-            "--host", "127.0.0.1",
-            "--ctx-size", str(config.get("context_length", model.context_length or self.settings.default_context_length)),
-            "--batch-size", str(config.get("batch_size", 512)),
-            "--ubatch-size", str(config.get("ubatch_size", 512)),
-            "--cont-batching",
-            "--api-key", provider.api_key,
-        ]
 
-        if role == "embedding":
-            cmd.extend(["--embedding", "--pooling", "cls"])
-        
-        if config.get("rope_freq_base"):
-            cmd.extend(["--rope-freq-base", str(config["rope_freq_base"])])
-        if config.get("rope_freq_scale"):
-            cmd.extend(["--rope-freq-scale", str(config["rope_freq_scale"])])
-        
-        creationflags = 0
-        if os.name == 'nt':
-            creationflags = subprocess.CREATE_NO_WINDOW
-        
-        provider.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            creationflags=creationflags,
-            env={**os.environ, "PATH": os.environ.get("PATH", "")},
-        )
-        
-        asyncio.create_task(self._monitor_stderr(provider))
-        
-        await self._wait_for_ready(provider)
-        
-        provider.client = httpx.AsyncClient(
-            base_url=base_url,
-            timeout=httpx.Timeout(300.0, connect=10.0),
-            headers={"Authorization": f"Bearer {provider.api_key}"},
-        )
-        
-        if not await self._health_check(provider):
-            raise RuntimeError("llama-server failed its health check after startup")
+        self._servers[model.id] = server
         provider.status = ModelStatus.READY
-    
-    async def _get_free_port(self) -> int:
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
-            return s.getsockname()[1]
-    
-    async def _wait_for_ready(self, provider: ModelProvider, timeout: float = 60.0):
-        import time
-        start = time.time()
-        while time.time() - start < timeout:
-            if provider.process and provider.process.poll() is not None:
-                detail = " | ".join(provider.stderr_tail[-8:])
-                raise RuntimeError(
-                    f"llama-server exited with code {provider.process.returncode}"
-                    + (f": {detail}" if detail else "")
-                )
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(
-                        f"http://127.0.0.1:{provider.port}/health",
-                        headers={"Authorization": f"Bearer {provider.api_key}"},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("status") == "ok":
-                            return
-            except:
-                pass
-            await asyncio.sleep(0.5)
-        raise TimeoutError(f"llama-server not ready after {timeout}s")
-    
-    async def _monitor_stderr(self, provider: ModelProvider):
-        if not provider.process or not provider.process.stderr:
-            return
-        loop = asyncio.get_event_loop()
-        while True:
-            line = await loop.run_in_executor(None, provider.process.stderr.readline)
-            if not line:
-                break
-            text = line.decode(errors="replace").strip()
-            provider.stderr_tail.append(text)
-            del provider.stderr_tail[:-100]
-            logger.info(f"[llama.cpp:{provider.model_id}] {text}")
-    
-    async def _health_check(self, provider: ModelProvider) -> bool:
-        if not provider.client:
-            return False
-        try:
-            resp = await provider.client.get("/health", timeout=5.0)
-            return resp.status_code == 200 and resp.json().get("status") == "ok"
-        except:
-            return False
-    
-    async def unload_model(self, role: str):
-        if role == "chat" and self.chat_provider:
-            provider = self.chat_provider
-            model_id = self.active_chat_model_id
-            self.chat_provider = None
-            self.active_chat_model_id = None
-        elif role == "embedding" and self.embedding_provider:
-            provider = self.embedding_provider
-            model_id = self.active_embedding_model_id
-            self.embedding_provider = None
-            self.active_embedding_model_id = None
+        if role == "chat":
+            self.chat_provider = provider
+            self.active_chat_model_id = model.id
         else:
-            return
-        
-        self._notify_status(model_id, ModelStatus.STOPPING, role)
-        
-        if provider.client:
+            self.embedding_provider = provider
+            self.active_embedding_model_id = model.id
+        self._notify_status(model.id, ModelStatus.READY, role)
+        return provider
+
+    async def unload_model(self, model_id: str) -> None:
+        """Stop a model server, accepting either its id or its role."""
+        provider: ModelProvider | None = None
+        if model_id == "chat":
+            provider = self.chat_provider
+        elif model_id == "embedding":
+            provider = self.embedding_provider
+        elif self.active_chat_model_id == model_id:
+            provider = self.chat_provider
+        elif self.active_embedding_model_id == model_id:
+            provider = self.embedding_provider
+        if provider is not None:
+            model_id = provider.model_id
+
+        server = self._servers.pop(model_id, None)
+        if provider is not None and provider.client is not None:
             await provider.client.aclose()
             provider.client = None
-        
-        if provider.process:
-            provider.process.terminate()
-            try:
-                await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, provider.process.wait),
-                    timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                provider.process.kill()
-                await asyncio.get_event_loop().run_in_executor(None, provider.process.wait)
-            provider.process = None
-        
-        self._notify_status(model_id, ModelStatus.NOT_LOADED, role)
-    
-    def get_chat_provider(self) -> Optional[ModelProvider]:
+        if server is not None:
+            await server.stop()
+            self._port_pool.release(server.port)
+            logger.info("Model %s unloaded", model_id)
+        if self.active_chat_model_id == model_id:
+            self.chat_provider = None
+            self.active_chat_model_id = None
+        if self.active_embedding_model_id == model_id:
+            self.embedding_provider = None
+            self.active_embedding_model_id = None
+
+    def get_server(self, model_id: str) -> LlamaServerProcess | None:
+        """Return the server process for a model, or None."""
+        return self._servers.get(model_id)
+
+    def get_server_by_role(
+        self, role: str, session_factory: Any
+    ) -> LlamaServerProcess | None:
+        """Return the running server matching a model role."""
+        provider = self.chat_provider if role == "chat" else self.embedding_provider
+        if provider is None:
+            return None
+        return self._servers.get(provider.model_id)
+
+    def get_chat_provider(self) -> ModelProvider | None:
         return self.chat_provider
-    
-    def get_embedding_provider(self) -> Optional[ModelProvider]:
+
+    def get_embedding_provider(self) -> ModelProvider | None:
         return self.embedding_provider
-    
-    async def wait_for_idle(self, timeout: float = 30.0):
-        start = asyncio.get_event_loop().time()
-        while self._generation_count > 0:
-            if asyncio.get_event_loop().time() - start > timeout:
-                logger.warning(f"Timeout waiting for {self._generation_count} generations")
-                break
+
+    def get_reranker_provider(self) -> None:
+        return None
+
+    def on_status_change(self, callback: Any) -> None:
+        self._status_callbacks.append(callback)
+
+    def _notify_status(self, model_id: str, status: str, role: str) -> None:
+        for callback in self._status_callbacks:
+            try:
+                callback(model_id, status, role)
+            except Exception:
+                logger.exception("Model status callback failed")
+
+    async def wait_for_idle(self, timeout: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout
+        while self._generation_count > 0 and time.monotonic() < deadline:
             await asyncio.sleep(0.1)
-    
+
     @asynccontextmanager
     async def generation_context(self):
         async with self._generation_lock:
@@ -362,3 +673,61 @@ class ModelLifecycleManager:
         finally:
             async with self._generation_lock:
                 self._generation_count -= 1
+
+    async def _get_free_port(self) -> int:
+        """Return a currently available managed port for compatibility checks."""
+        port = self._port_pool.acquire("probe")
+        self._port_pool.release(port)
+        return port
+
+    async def health_check(self, model_id: str) -> dict[str, Any]:
+        """Return health status for a specific model."""
+        server = self._servers.get(model_id)
+        if server is None:
+            return {"model_id": model_id, "status": "not_loaded"}
+
+        healthy = await server.is_healthy()
+        return {
+            "model_id": model_id,
+            "status": "healthy" if healthy else "unhealthy",
+            **server.diagnostics(),
+        }
+
+    def list_servers(self) -> dict[str, Any]:
+        """Return diagnostics for all managed servers."""
+        return {
+            model_id: server.diagnostics()
+            for model_id, server in self._servers.items()
+        }
+
+    # ── internals ──────────────────────────────────────────────
+
+    def _resolve_binary(self) -> Path:
+        """Locate the llama-server binary.
+
+        Search order:
+            1. settings.llama_server_path (if set)
+            2. resources/bin/llama-server.exe  (Windows)
+            3. resources/bin/llama-server      (Linux/macOS)
+            4. System PATH via shutil.which
+        """
+        candidates: list[Path | str | None] = [
+            getattr(self.settings, "llama_server_path", None),
+            Path("resources/bin/llama-server.exe"),
+            Path("resources/bin/llama-server"),
+            shutil.which("llama-server"),
+        ]
+
+        for candidate in candidates:
+            if candidate is not None:
+                p = Path(candidate)
+                if p.is_file():
+                    logger.info("Found llama-server binary: %s", p)
+                    return p
+
+        searched = ", ".join(str(c) for c in candidates if c is not None)
+        raise FileNotFoundError(
+            f"llama-server binary not found. Searched: {searched}. "
+            f"Place the binary at resources/bin/llama-server.exe "
+            f"or set settings.llama_server_path."
+        )
