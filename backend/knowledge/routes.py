@@ -328,6 +328,36 @@ async def list_documents(
     documents = db.query(Document).filter(Document.collection_id == collection_id).all()
     return [document_to_response(d) for d in documents]
 
+
+@router.get("/documents/{document_id}/status")
+async def document_status(
+    document_id: str,
+    current_user: User = Depends(require_permission("knowledge:list")),
+    db: Session = Depends(get_db),
+):
+    """Return the latest durable ingestion state for an accessible document."""
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(404, "Document not found")
+    permission = db.query(CollectionPermission).filter(
+        CollectionPermission.collection_id == document.collection_id,
+        CollectionPermission.user_id == current_user.id,
+        CollectionPermission.permission.in_(["read", "write", "admin"]),
+    ).first()
+    if permission is None and current_user.id != document.collection.owner_id:
+        raise HTTPException(403, "Not authorized to view this document")
+    job = db.query(IngestionJob).filter(
+        IngestionJob.document_id == document_id
+    ).order_by(IngestionJob.created_at.desc()).first()
+    return {
+        "documentId": document.id,
+        "filename": document.original_filename or document.filename,
+        "status": job.status if job else document.status,
+        "currentStage": job.current_stage if job else document.status,
+        "progress": job.progress if job else (100 if document.status == "ready" else 0),
+        "errorMessage": job.error_message if job else document.error_message,
+    }
+
 @router.delete("/documents/{document_id}")
 async def delete_document(
     document_id: str,

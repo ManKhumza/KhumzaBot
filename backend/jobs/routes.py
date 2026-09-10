@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
+from datetime import datetime
 from sqlalchemy.orm import Session
 from typing import Optional
 from backend.auth.dependencies import get_db, get_current_user, require_permission
@@ -35,6 +36,31 @@ async def list_jobs(
         for job in jobs
     ]
 
+
+@router.get("/{job_id}")
+async def get_job(
+    job_id: str,
+    current_user: User = Depends(require_permission("admin:jobs")),
+    db: Session = Depends(get_db),
+):
+    """Return one durable ingestion job."""
+    job = db.get(IngestionJob, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    return {
+        "id": job.id,
+        "documentId": job.document_id,
+        "collectionId": job.collection_id,
+        "status": job.status,
+        "priority": job.priority,
+        "currentStage": job.current_stage,
+        "progress": job.progress,
+        "errorMessage": job.error_message,
+        "startedAt": job.started_at.isoformat() if job.started_at else None,
+        "completedAt": job.completed_at.isoformat() if job.completed_at else None,
+        "createdAt": job.created_at.isoformat() if job.created_at else "",
+    }
+
 @router.post("/{job_id}/retry")
 async def retry_job(
     job_id: str,
@@ -45,6 +71,8 @@ async def retry_job(
     job = db.query(IngestionJob).filter(IngestionJob.id == job_id).first()
     if not job:
         raise HTTPException(404, "Job not found")
+    if job.status not in ("failed", "cancelled"):
+        raise HTTPException(400, f"Cannot retry job with status '{job.status}'")
     job.status = "pending"
     job.error_message = None
     job.started_at = None
@@ -64,7 +92,11 @@ async def cancel_job(
     job = db.query(IngestionJob).filter(IngestionJob.id == job_id).first()
     if not job:
         raise HTTPException(404, "Job not found")
-    if job.status in ["pending", "running"]:
-        job.status = "cancelled"
-        db.commit()
+    if job.status not in ("pending", "running"):
+        raise HTTPException(400, f"Cannot cancel job with status '{job.status}'")
+    job.status = "cancelled"
+    job.current_stage = "cancelled"
+    job.error_message = "Cancelled by user"
+    job.completed_at = datetime.utcnow()
+    db.commit()
     return {"success": True}
