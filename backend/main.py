@@ -133,7 +133,7 @@ async def lifespan(app: FastAPI):
     settings.ensure_directories()
     
     # Initialize database
-    engine = await init_db(settings.database_url)
+    engine = await init_db(settings.database_url, data_dir=settings.data_dir)
     
     # Run migrations
     await run_migrations(engine)

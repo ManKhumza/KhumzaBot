@@ -31,7 +31,9 @@ class VectorStore:
     
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            from backend.db.database import open_dbapi_connection
+
+            self._conn = open_dbapi_connection(f"sqlite:///{self.db_path}")
             self._conn.enable_load_extension(True)
             sqlite_vec.load(self._conn)
             self._conn.enable_load_extension(False)

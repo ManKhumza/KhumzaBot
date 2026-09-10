@@ -45,11 +45,17 @@ class Settings(BaseSettings):
     ingestion_embedding_batch_size: int = 16
     
     # Security
+    encryption_enabled: bool = True
+    key_file_name: str = ".nocai.key"
     session_timeout_minutes: int = 480
     max_failed_logins: int = 5
     lockout_duration_minutes: int = 15
     password_min_length: int = 12
     require_special_chars: bool = True
+
+    # Local inference process port allocation
+    inference_port_start: int = 8100
+    inference_port_end: int = 8200
     
     # Logging
     log_level: str = "INFO"

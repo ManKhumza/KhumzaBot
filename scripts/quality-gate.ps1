@@ -111,6 +111,52 @@ if ($PreflightProblems.Count -eq 0) {
 }
 Add-GateResult -Name "preflight and resource integrity" -Passed ($PreflightProblems.Count -eq 0) -Seconds $PreflightTimer.Elapsed.TotalSeconds -Log $PreflightLog -Detail ($PreflightProblems -join "; ")
 
+$SecurityTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$SecurityProblems = [System.Collections.Generic.List[string]]::new()
+$SecurityPaths = @(
+    "backend\security\__init__.py",
+    "backend\security\dpapi.py",
+    "backend\security\encryption.py",
+    "apps\desktop\electron-builder.yml",
+    ".github\workflows\build-windows.yml",
+    "scripts\verify-packaging.ps1",
+    "tests\test_security.py"
+)
+foreach ($RelativePath in $SecurityPaths) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot $RelativePath) -PathType Leaf)) {
+        $SecurityProblems.Add("Missing security deliverable: $RelativePath")
+    }
+}
+$BuilderConfigPath = Join-Path $ProjectRoot "apps\desktop\electron-builder.yml"
+if (Test-Path -LiteralPath $BuilderConfigPath) {
+    $BuilderConfig = Get-Content -LiteralPath $BuilderConfigPath -Raw
+    if ($BuilderConfig -notmatch '(?m)^\s*perMachine:\s*false\s*$') {
+        $SecurityProblems.Add("Windows installer is not explicitly user-scope")
+    }
+    if ($BuilderConfig -notmatch '(?m)^\s*requestedExecutionLevel:\s*asInvoker\s*$') {
+        $SecurityProblems.Add("Windows executable is not explicitly configured asInvoker")
+    }
+}
+$TrackedSourceFiles = @(& git -C $ProjectRoot ls-files -- "backend/*.py" "apps/*.ts" "apps/*.tsx" "scripts/*.ps1")
+foreach ($SourceFile in $TrackedSourceFiles) {
+    $AbsoluteSourcePath = Join-Path $ProjectRoot $SourceFile
+    if ((Get-Content -LiteralPath $AbsoluteSourcePath -Raw) -match '-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|sk-[A-Za-z0-9_-]{20,}') {
+        $SecurityProblems.Add("Potential embedded credential in tracked source: $SourceFile")
+    }
+}
+$TrackedSecretFiles = @(& git -C $ProjectRoot ls-files -- "*.pem" "*.key" "*.p12" "*.pfx" ".env")
+if ($TrackedSecretFiles.Count -gt 0) {
+    $SecurityProblems.Add("Certificate, key, or environment secret file is tracked")
+}
+$SecurityTimer.Stop()
+$SecurityLog = Join-Path $LogDirectory "security-configuration.log"
+if ($SecurityProblems.Count -eq 0) {
+    "Encryption and Windows packaging security controls are present." | Set-Content -LiteralPath $SecurityLog
+} else {
+    $SecurityProblems | Set-Content -LiteralPath $SecurityLog
+}
+Add-GateResult -Name "security configuration" -Passed ($SecurityProblems.Count -eq 0) -Seconds $SecurityTimer.Elapsed.TotalSeconds -Log $SecurityLog -Detail ($SecurityProblems -join "; ")
+
 if (Test-Path -LiteralPath $Python -PathType Leaf) {
     Invoke-GateStep "Python compile" $Python @("-m", "compileall", "-q", "backend")
     Invoke-GateStep "Required test coverage inventory" $Python @("scripts\verify_quality_coverage.py")
@@ -123,6 +169,13 @@ if (Get-Command "npm.cmd" -ErrorAction SilentlyContinue) {
 }
 if ($Package) {
     Invoke-GateStep "Clean package and release verification" $PowerShellExecutable @("-NoProfile", "-File", (Join-Path $PSScriptRoot "build-all.ps1"))
+    Invoke-GateStep "Packaging security verification" $PowerShellExecutable @(
+        "-NoProfile",
+        "-File",
+        (Join-Path $PSScriptRoot "verify-packaging.ps1"),
+        "-InstallerPath",
+        (Join-Path $ProjectRoot "apps\desktop\electron\release")
+    )
 }
 
 $Passed = ($script:Results.Count -gt 0 -and @($script:Results | Where-Object { -not $_.passed }).Count -eq 0)

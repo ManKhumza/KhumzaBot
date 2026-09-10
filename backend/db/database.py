@@ -4,10 +4,22 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.engine import make_url
 import uuid
+import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from functools import lru_cache
+
+from backend.security.dpapi import KeyManager
+from backend.security.encryption import (
+    get_connection,
+    is_encryption_enabled,
+    migrate_to_encrypted,
+)
+
+logger = logging.getLogger("nocai.db")
 
 Base = declarative_base()
 
@@ -279,14 +291,29 @@ class Setting(Base):
     user = relationship("User")
 
 
+_database_encryption_keys: dict[str, str] = {}
+
+
 @lru_cache(maxsize=4)
-def create_db_engine(database_url: str):
-    engine = create_engine(
-        database_url,
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        echo=False,
-    )
+def _create_db_engine(database_url: str, encryption_key_hex: str | None = None):
+    if encryption_key_hex is None:
+        engine = create_engine(
+            database_url,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            echo=False,
+        )
+    else:
+        db_path = make_url(database_url).database
+        if not db_path:
+            raise ValueError("Encrypted databases require a file-backed SQLite URL")
+        encryption_key = bytes.fromhex(encryption_key_hex)
+        engine = create_engine(
+            "sqlite://",
+            creator=lambda: get_connection(db_path, encryption_key),
+            poolclass=StaticPool,
+            echo=False,
+        )
     
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
@@ -299,14 +326,60 @@ def create_db_engine(database_url: str):
     return engine
 
 
+def create_db_engine(database_url: str, encryption_key_hex: str | None = None):
+    """Create or reuse an engine without losing its process-local key binding."""
+    if encryption_key_hex is not None:
+        _database_encryption_keys[database_url] = encryption_key_hex
+    elif is_encryption_enabled():
+        encryption_key_hex = _database_encryption_keys.get(database_url)
+    return _create_db_engine(database_url, encryption_key_hex)
+
+
+def open_dbapi_connection(database_url: str):
+    """Open a raw connection with the same encryption binding as SQLAlchemy."""
+    db_path = make_url(database_url).database
+    if not db_path:
+        raise ValueError("A file-backed SQLite URL is required")
+    encryption_key_hex = _database_encryption_keys.get(database_url)
+    if encryption_key_hex is not None and is_encryption_enabled():
+        return get_connection(db_path, bytes.fromhex(encryption_key_hex))
+
+    import sqlite3
+    return sqlite3.connect(db_path, check_same_thread=False)
+
+
+def _clear_db_engine_cache() -> None:
+    _create_db_engine.cache_clear()
+    _database_encryption_keys.clear()
+
+
+create_db_engine.cache_clear = _clear_db_engine_cache
+
+
 def get_session_factory(engine_or_url):
     """Return sessions bound to the shared engine for a URL."""
     engine = create_db_engine(engine_or_url) if isinstance(engine_or_url, str) else engine_or_url
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
-async def init_db(database_url: str):
-    engine = create_db_engine(database_url)
+async def init_db(database_url: str, data_dir: str | None = None):
+    """Initialize the database, encrypting production data with SQLCipher."""
+    encryption_key_hex = None
+    if data_dir and is_encryption_enabled():
+        db_path_value = make_url(database_url).database
+        if not db_path_value:
+            raise ValueError("Encrypted databases require a file-backed SQLite URL")
+
+        db_path = Path(db_path_value)
+        encryption_key = KeyManager(data_dir).get_or_create_key()
+        if db_path.is_file() and db_path.stat().st_size:
+            migrate_to_encrypted(db_path, encryption_key)
+        encryption_key_hex = encryption_key.hex()
+        logger.info("Database encryption enabled")
+    elif data_dir:
+        logger.warning("Database encryption explicitly disabled for this process")
+
+    engine = create_db_engine(database_url, encryption_key_hex)
     Base.metadata.create_all(engine)
     return engine
 

@@ -1,0 +1,83 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: Sign with the configured user-owned certificate
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+jobs:
+  build-and-verify:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Create repository virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          ./.venv/Scripts/python.exe -m pip install --disable-pip-version-check -e "./backend[dev]"
+
+      - name: Run clean package quality gate
+        shell: pwsh
+        run: ./scripts/quality-gate.ps1 -Package
+
+      - name: Build signed release
+        if: github.event_name == 'workflow_dispatch' && inputs.sign
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          NOC_AI_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:CERTIFICATE_BASE64 -or -not $env:NOC_AI_CERT_PASSWORD) {
+            throw "Signing was requested but the certificate secrets are unavailable."
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "nocai-signing.pfx"
+          try {
+            [System.IO.File]::WriteAllBytes(
+              $certificatePath,
+              [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
+            )
+            $env:NOC_AI_CERT_PFX = $certificatePath
+            ./scripts/build-all.ps1 -Sign
+            ./scripts/verify-packaging.ps1 -InstallerPath "apps/desktop/electron/release" -RequireSignature
+          } finally {
+            if (Test-Path -LiteralPath $certificatePath) {
+              Remove-Item -LiteralPath $certificatePath -Force
+            }
+          }
+
+      - name: Upload verified installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOC-AI-Assistant-Windows
+          path: |
+            apps/desktop/electron/release/NOC-AI-Assistant-Setup-*.exe
+            apps/desktop/electron/release/NOC-AI-Assistant-Portable-*.exe
+            apps/desktop/electron/release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

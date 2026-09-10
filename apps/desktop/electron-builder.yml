@@ -1,0 +1,66 @@
+# electron-builder configuration for NOC AI Assistant
+# CRITICAL: perMachine=false ensures user-scope install (no UAC prompt)
+
+appId: com.nocai.assistant
+productName: NOC AI Assistant
+copyright: Copyright © 2026 NOC AI
+
+directories:
+  output: dist
+  buildResources: resources
+
+files:
+  - "out/**/*"
+  - "package.json"
+  - "!node_modules/**/*"
+  - "!src/**/*"
+  - "!scripts/**/*"
+
+# Backend binary (built by PyInstaller)
+extraResources:
+  - from: "../../backend/dist/nocai-backend.exe"
+    to: "backend/nocai-backend.exe"
+  - from: "../../resources/models/"
+    to: "models/"
+    filter:
+      - "**/*.gguf"
+
+asar: true
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: resources/icon.ico
+  # Code signing configuration
+  # Certificate is provided via environment variables in CI/CD
+  certificateFile: "${env.SIGNING_CERT_PATH}"
+  certificatePassword: "${env.SIGNING_CERT_PASSWORD}"
+  # If no certificate is available, build unsigned (dev builds only)
+  signAndEditExecutable: true
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: false
+  # CRITICAL: User-scope install. Installs to %LOCALAPPDATA%.
+  # Does NOT require Administrator privileges.
+  # Does NOT write to C:\Program Files.
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: NOC AI Assistant
+  uninstallDisplayName: NOC AI Assistant
+
+# Portable build (optional, for testing)
+portable:
+  artifactName: "${productName}-${version}-portable.exe"
+
+# Appx for Microsoft Store (future)
+# appx:
+#   publisher: "CN=NOC AI"
+#   identityName: "NOC-AI.Assistant"
+
+# Publish configuration (disabled by default)
+publish: null
