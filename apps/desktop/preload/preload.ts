@@ -1,3 +1,11 @@
+import { IPC } from '../shared/ipc-contract';
+import type {
+  ChatLoadPayload,
+  ChatSendPayload,
+  KnowledgeUploadPayload,
+  ReprocessPayload,
+} from '../shared/ipc-contract';
+
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Expose the full nocai API that the renderer expects
@@ -21,9 +29,11 @@ contextBridge.exposeInMainWorld('nocai', {
     renameConversation: (id: string, title: string) => ipcRenderer.invoke('nocai:chat:renameConversation', { id, title }),
     updateConversation: (id: string, updates: Record<string, unknown>) =>
       ipcRenderer.invoke('nocai:chat:updateConversation', { id, updates }),
-    getMessages: (conversationId: string, limit?: number, offset?: number) => 
-      ipcRenderer.invoke('nocai:chat:getMessages', { conversationId, limit, offset }),
-    sendMessage: (request: any) => ipcRenderer.invoke('nocai:chat:sendMessage', request),
+    getMessages: (conversationId: string, limit?: number, offset?: number) => {
+      const payload: ChatLoadPayload = { conversationId, limit, offset };
+      return ipcRenderer.invoke('nocai:chat:getMessages', payload);
+    },
+    sendMessage: (request: ChatSendPayload) => ipcRenderer.invoke('nocai:chat:sendMessage', request),
     stopGeneration: (generationId: string) => ipcRenderer.invoke('nocai:chat:stopGeneration', generationId),
   },
   
@@ -45,11 +55,16 @@ contextBridge.exposeInMainWorld('nocai', {
     createCollection: (req: any) => ipcRenderer.invoke('nocai:knowledge:createCollection', req),
     deleteCollection: (id: string) => ipcRenderer.invoke('nocai:knowledge:deleteCollection', id),
     selectDocuments: () => ipcRenderer.invoke('nocai:knowledge:selectDocuments'),
-    uploadDocuments: (collectionId: string, filePaths: string[]) =>
-      ipcRenderer.invoke('nocai:knowledge:uploadDocuments', { collectionId, filePaths }),
+    uploadDocuments: (collectionId: string, filePaths: string[]) => {
+      const payload: KnowledgeUploadPayload = { collectionId, filePaths };
+      return ipcRenderer.invoke('nocai:knowledge:uploadDocuments', payload);
+    },
     listDocuments: (collectionId: string) => ipcRenderer.invoke('nocai:knowledge:listDocuments', collectionId),
     deleteDocument: (id: string) => ipcRenderer.invoke('nocai:knowledge:deleteDocument', id),
-    reprocessDocument: (id: string) => ipcRenderer.invoke('nocai:knowledge:reprocessDocument', id),
+    reprocessDocument: (id: string) => {
+      const payload: ReprocessPayload = { documentId: id };
+      return ipcRenderer.invoke('nocai:knowledge:reprocessDocument', payload);
+    },
     search: (req: any) => ipcRenderer.invoke('nocai:knowledge:search', req),
   },
   
@@ -80,6 +95,7 @@ contextBridge.exposeInMainWorld('nocai', {
     createBackup: (options: any) => ipcRenderer.invoke('nocai:system:createBackup', options),
     restoreBackup: (path: string) => ipcRenderer.invoke('nocai:system:restoreBackup', path),
     restartBackend: () => ipcRenderer.invoke('nocai:system:restartBackend'),
+    shutdown: () => ipcRenderer.invoke(IPC.SYSTEM_SHUTDOWN),
   },
   
   // Events (Main -> Renderer)

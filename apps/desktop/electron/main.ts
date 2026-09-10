@@ -1,4 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, session } from 'electron';
+import { IPC } from '../shared/ipc-contract';
+import type {
+  ChatLoadPayload,
+  ChatSendPayload,
+  KnowledgeUploadPayload,
+  RenamePayload,
+  ReprocessPayload,
+} from '../shared/ipc-contract';
 import { basename, join } from 'path';
 import { spawn, SpawnOptions } from 'child_process';
 import { randomBytes } from 'crypto';
@@ -553,10 +561,11 @@ function setupIpcHandlers(): void {
   });
   
   ipcMain.handle('nocai:chat:renameConversation', async (event, { id, title }) => {
-    const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/conversations/${id}`, {
+    const payload = { id, title } satisfies RenamePayload;
+    const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/conversations/${payload.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title: payload.title }),
     });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
@@ -572,7 +581,7 @@ function setupIpcHandlers(): void {
     return response.json();
   });
   
-  ipcMain.handle('nocai:chat:getMessages', async (event, { conversationId, limit, offset }) => {
+  ipcMain.handle('nocai:chat:getMessages', async (event, { conversationId, limit, offset }: ChatLoadPayload) => {
     const params = new URLSearchParams({ limit: String(limit || 50), offset: String(offset || 0) });
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/conversations/${conversationId}/messages?${params}`, {
       headers: { 'Authorization': `Bearer ${sessionToken}` },
@@ -581,7 +590,7 @@ function setupIpcHandlers(): void {
     return response.json();
   });
 
-  ipcMain.handle('nocai:chat:sendMessage', async (event, request) => {
+  ipcMain.handle('nocai:chat:sendMessage', async (event, request: ChatSendPayload) => {
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
@@ -725,7 +734,7 @@ function setupIpcHandlers(): void {
     });
   });
   
-  ipcMain.handle('nocai:knowledge:uploadDocuments', async (event, { collectionId, filePaths }) => {
+  ipcMain.handle('nocai:knowledge:uploadDocuments', async (event, { collectionId, filePaths }: KnowledgeUploadPayload) => {
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/knowledge/collections/${collectionId}/documents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
@@ -752,7 +761,7 @@ function setupIpcHandlers(): void {
     return response.json();
   });
   
-  ipcMain.handle('nocai:knowledge:reprocessDocument', async (event, id) => {
+  ipcMain.handle('nocai:knowledge:reprocessDocument', async (event, { documentId: id }: ReprocessPayload) => {
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/knowledge/documents/${id}/reprocess`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${sessionToken}` },
@@ -876,6 +885,10 @@ function setupIpcHandlers(): void {
 
   ipcMain.handle('nocai:system:getVersion', async () => {
     return app.getVersion();
+  });
+
+  ipcMain.handle(IPC.SYSTEM_SHUTDOWN, async () => {
+    await shutdown();
   });
   
   ipcMain.handle('nocai:system:getDataPaths', async () => {
