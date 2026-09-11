@@ -1,131 +1,138 @@
-"""Tests for soak and resource leaks."""
-
+"""Deterministic CI resource checks; the release gate also runs the extended soak."""
 import asyncio
 import gc
-import psutil
+import logging
+import math
 import os
 from pathlib import Path
-from fastapi.testclient import TestClient
+
+import psutil
+from sqlalchemy import text
+
+from test_backend_runtime_integrity import isolated_backend
+from backend.documents.coordinator import IngestionCoordinator
+from backend.inference.lifecycle import ModelLifecycleManager
+from backend.db.models import Model
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_soak_resource_leaks_process_count(tmp_path, monkeypatch):
-    """Soak: repeated start/stop doesn't leak processes."""
-    data_dir = tmp_path / "data"
-    monkeypatch.setenv("NOC_AI_DATA_DIR", str(data_dir))
-    monkeypatch.setenv("NOC_AI_MODELS_DIR", str(data_dir / "models"))
-    monkeypatch.setenv("NOC_AI_KNOWLEDGE_DIR", str(data_dir / "knowledge"))
-    monkeypatch.setenv("NOC_AI_LOGS_DIR", str(data_dir / "logs"))
-    monkeypatch.setenv("NOC_AI_DATABASE_URL", f"sqlite:///{data_dir / 'test.db'}")
-    monkeypatch.setenv("NOC_AI_SESSION_TOKEN", "test-transport-secret")
-
-    from backend.config import get_settings
-    from backend.db.database import create_db_engine
-    from backend.main import create_app
-
-    get_settings.cache_clear()
-    create_db_engine.cache_clear()
-
-    # Multiple rapid app creations/destructions should not leak
-    for i in range(5):
-        with TestClient(create_app()) as client:
-            transport_headers = {"X-NOC-AI-Backend-Token": "test-transport-secret"}
-            health = client.get("/health/ready", headers=transport_headers)
-            assert health.status_code == 200
-        
-        get_settings.cache_clear()
-        create_db_engine.cache_clear()
-    
-    # Force garbage collection
+def test_soak_resource_leaks_process_count(isolated_backend):
+    settings, engine, factory = isolated_backend
+    process = psutil.Process()
+    baseline_children = {child.pid for child in process.children(recursive=True)}
+    baseline_threads = process.num_threads()
+    baseline_handles = process.num_handles() if os.name == "nt" else process.num_fds()
+    baseline_memory = process.memory_info().rss
+    async def scenario():
+        for index in range(8):
+            manager = ModelLifecycleManager(settings)
+            await manager.startup(factory)
+            worker = IngestionCoordinator(settings, factory, manager)
+            await worker.start()
+            await worker.stop()
+            await manager.shutdown()
+            assert worker.worker is None
+            assert manager._monitor_task is None
+            assert not manager.list_servers()
+            with engine.begin() as db:
+                db.execute(text("UPDATE documents SET error_message=:value"), {"value": f"cycle-{index}"})
+            with engine.connect() as db:
+                assert db.execute(text("PRAGMA integrity_check")).scalar() == "ok"
+    asyncio.run(scenario())
     gc.collect()
+    assert {child.pid for child in process.children(recursive=True)} == baseline_children
+    assert process.num_threads() <= baseline_threads + 2
+    handles = process.num_handles() if os.name == "nt" else process.num_fds()
+    assert handles <= baseline_handles + 12
+    assert process.memory_info().rss < baseline_memory + 64 * 1024**2
 
 
-def test_soak_resource_leaks_database_locks(tmp_path, monkeypatch):
-    """Soak: repeated operations don't leave database locks."""
-    data_dir = tmp_path / "data"
-    monkeypatch.setenv("NOC_AI_DATA_DIR", str(data_dir))
-    monkeypatch.setenv("NOC_AI_MODELS_DIR", str(data_dir / "models"))
-    monkeypatch.setenv("NOC_AI_KNOWLEDGE_DIR", str(data_dir / "knowledge"))
-    monkeypatch.setenv("NOC_AI_LOGS_DIR", str(data_dir / "logs"))
-    monkeypatch.setenv("NOC_AI_DATABASE_URL", f"sqlite:///{data_dir / 'test.db'}")
-    monkeypatch.setenv("NOC_AI_SESSION_TOKEN", "test-transport-secret")
-
-    from backend.config import get_settings
-    from backend.db.database import create_db_engine
-    from backend.main import create_app
-
-    get_settings.cache_clear()
-    create_db_engine.cache_clear()
-
-    with TestClient(create_app()) as client:
-        transport_headers = {"X-NOC-AI-Backend-Token": "test-transport-secret"}
-        
-        # Login
-        login = client.post(
-            "/api/v1/auth/login",
-            json={"username": "admin", "password": "ChangeMe-12345!"},
-            headers=transport_headers,
-        )
-        assert login.status_code == 200
-        headers = {
-            **transport_headers,
-            "Authorization": f"Bearer {login.json()['token']}",
-        }
-        
-        # Multiple API calls
-        for i in range(10):
-            health = client.get("/health/ready", headers=headers)
-            assert health.status_code == 200
-        
-        # Database should not be locked after
-
-    get_settings.cache_clear()
-    create_db_engine.cache_clear()
+def test_soak_resource_leaks_database_locks(isolated_backend):
+    settings, engine, factory = isolated_backend
+    from backend.retrieval.vector_store import VectorStore
+    import sqlite3
+    for _ in range(12):
+        store = VectorStore(settings.database_url, 384)
+        store._get_conn().execute("SELECT count(*) FROM chunks_vec").fetchone()
+        store.close()
+        with sqlite3.connect(str(Path(settings.data_dir) / "test.db"), timeout=0.1) as independent:
+            independent.execute("BEGIN IMMEDIATE")
+            independent.execute("UPDATE documents SET chunk_count=chunk_count+1")
+            independent.commit()
+    with factory() as db:
+        from backend.db.models import Document
+        assert db.get(Document, "document").chunk_count == 12
+    with engine.connect() as db:
+        assert db.execute(text("PRAGMA integrity_check")).scalar() == "ok"
 
 
 def test_soak_resource_leaks_log_growth(tmp_path, monkeypatch):
-    """Soak: log growth is bounded."""
-    data_dir = tmp_path / "data"
-    monkeypatch.setenv("NOC_AI_DATA_DIR", str(data_dir))
-    monkeypatch.setenv("NOC_AI_MODELS_DIR", str(data_dir / "models"))
-    monkeypatch.setenv("NOC_AI_KNOWLEDGE_DIR", str(data_dir / "knowledge"))
-    monkeypatch.setenv("NOC_AI_LOGS_DIR", str(data_dir / "logs"))
-    monkeypatch.setenv("NOC_AI_DATABASE_URL", f"sqlite:///{data_dir / 'test.db'}")
-    monkeypatch.setenv("NOC_AI_SESSION_TOKEN", "test-transport-secret")
-
-    from backend.config import get_settings
-    from backend.db.database import create_db_engine
-    from backend.main import create_app
-
-    get_settings.cache_clear()
-    create_db_engine.cache_clear()
-
-    with TestClient(create_app()) as client:
-        transport_headers = {"X-NOC-AI-Backend-Token": "test-transport-secret"}
-        health = client.get("/health/ready", headers=transport_headers)
-        assert health.status_code == 200
-
-    get_settings.cache_clear()
-    create_db_engine.cache_clear()
+    from backend.system.diagnostics import open_diagnostics, close_diagnostics
+    import secrets
+    secret = secrets.token_urlsafe(32)
+    monkeypatch.setenv("NOC_AI_SESSION_TOKEN", secret)
+    handler = open_diagnostics(tmp_path, max_bytes=1024, backups=3)
+    logger = logging.getLogger("nocai.soak")
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        for index in range(500):
+            logger.info("Owned component diagnostic %s token=%s", index, secret)
+        handler.flush()
+    finally:
+        logger.setLevel(old_level)
+        close_diagnostics(handler)
+    files = list(tmp_path.glob("backend.log*"))
+    assert len(files) == 4
+    assert sum(file.stat().st_size for file in files) <= 4 * 1200
+    combined = "".join(file.read_text(encoding="utf-8") for file in files)
+    assert secret not in combined
+    assert "[REDACTED]" in combined
 
 
-def test_soak_resource_leaks_orphan_processes(tmp_path):
-    """Soak: no orphan processes after operations."""
-    # Test that child processes are cleaned up
-    import subprocess
-    import sys
-    
-    # Verify no subprocess.Popen leaks in lifecycle manager
-    from backend.inference.lifecycle import ModelLifecycleManager
-    
-    # The lifecycle manager should use proper cleanup in unload_model
-    assert hasattr(ModelLifecycleManager, 'unload_model')
-    assert hasattr(ModelLifecycleManager, 'shutdown')
+def test_soak_resource_leaks_orphan_processes(isolated_backend):
+    settings, _, factory = isolated_backend
+    model_path = ROOT / "resources/models/bge-small-en-v1.5-q8_0.gguf"
+    settings.llama_server_path = str(ROOT / "runtimes/llama/llama-server.exe")
+    with factory() as db:
+        model = db.get(Model, "embedding")
+        model.filepath = str(model_path)
+        model.context_length = 512
+        db.commit()
+    children = []
+    async def scenario():
+        manager = ModelLifecycleManager(settings)
+        await manager.startup(factory)
+        try:
+            for _ in range(3):
+                with factory() as db:
+                    provider = await manager.load_model(db.get(Model, "embedding"), "embedding")
+                child = psutil.Process(provider.process.process.pid)
+                children.append(child)
+                assert provider.api_key not in " ".join(child.cmdline())
+                vectors = await provider.embed_batch(["Network link status", "Maintenance window"])
+                assert len(vectors) == 2
+                assert all(len(vector) == 384 and all(math.isfinite(value) for value in vector) for vector in vectors)
+                await manager.unload_model("embedding")
+                assert not child.is_running()
+                assert manager._port_pool.in_use_count == 0
+        finally:
+            await manager.shutdown()
+    asyncio.run(scenario())
+    assert all(not child.is_running() for child in children)
 
 
-def test_soak_bounded_queues_and_backpressure(tmp_path):
-    """Soak: queues and request bodies are bounded."""
-    from backend.config import Settings
-    
-    # Settings should have bounds for upload sizes, queue sizes
-    settings = Settings()
-    # Check for relevant settings
+def test_soak_bounded_queues_and_backpressure(isolated_backend):
+    settings, _, factory = isolated_backend
+    worker = IngestionCoordinator(settings, factory, ModelLifecycleManager(settings))
+    async def scenario():
+        for index in range(10_000):
+            await worker.enqueue(f"job-{index}")
+        for _ in range(100):
+            await worker.enqueue("job-0")
+        assert worker.queue.qsize() == 256
+        assert len(worker._queued_ids) == 256
+        assert worker.queue.get_nowait() == "job-0"
+        await worker.stop()
+    asyncio.run(scenario())

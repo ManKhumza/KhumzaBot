@@ -1,4 +1,4 @@
-import React, { Fragment } from 'react';
+import React, { useEffect, useId, useRef } from 'react';
 import { X } from 'lucide-react';
 import { clsx } from 'clsx';
 import { createPortal } from 'react-dom';
@@ -13,22 +13,43 @@ interface DialogProps {
 }
 
 export const Dialog = ({ open, onOpenChange, title, description, children, className }: DialogProps) => {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+  const descriptionId = useId();
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const content = contentRef.current;
+    if (content && !content.contains(document.activeElement)) {
+      (content.querySelector<HTMLElement>('input:not([disabled]),button:not([disabled]),[tabindex="0"]') || content).focus();
+    }
+    return () => { if (previous?.isConnected) previous.focus(); };
+  }, [open]);
   if (!open) return null;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') onOpenChange(false);
+    if (e.key === 'Tab') {
+      const focusable = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]') || []).filter(element => element.getClientRects().length > 0);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+    }
   };
 
   const content = (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby={title ? 'dialog-title' : undefined} aria-describedby={description ? 'dialog-description' : undefined}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby={title ? titleId : undefined} aria-describedby={description ? descriptionId : undefined}>
       <div
         className="fixed inset-0 bg-black/50 animate-in"
         onClick={() => onOpenChange(false)}
         aria-hidden="true"
       />
       <div
+        ref={contentRef}
+        tabIndex={-1}
         className={clsx(
-          'relative z-50 w-[calc(100%-2rem)] max-w-lg rounded-lg border border-border bg-card p-6 shadow-lg animate-in fade-in-0 zoom-in-95',
+          'relative z-50 max-h-[calc(100vh-2rem)] w-[calc(100%-2rem)] max-w-2xl overflow-y-auto rounded-lg border border-border bg-card p-6 shadow-lg animate-in fade-in-0 zoom-in-95',
           className
         )}
         onKeyDown={handleKeyDown}
@@ -41,8 +62,8 @@ export const Dialog = ({ open, onOpenChange, title, description, children, class
         >
           <X className="w-4 h-4" />
         </button>
-        {title && <h2 id="dialog-title" className="text-lg font-semibold text-foreground mb-1">{title}</h2>}
-        {description && <p id="dialog-description" className="text-sm text-muted-foreground mb-4">{description}</p>}
+        {title && <h2 id={titleId} className="text-lg font-semibold text-foreground mb-1">{title}</h2>}
+        {description && <p id={descriptionId} className="text-sm text-muted-foreground mb-4">{description}</p>}
         {children}
       </div>
     </div>

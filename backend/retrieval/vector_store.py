@@ -1,5 +1,4 @@
 import sqlite3
-import sqlite_vec
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional
@@ -32,29 +31,23 @@ class VectorStore:
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             from backend.db.database import open_dbapi_connection
-
-            self._conn = open_dbapi_connection(f"sqlite:///{self.db_path}")
-            self._conn.enable_load_extension(True)
-            sqlite_vec.load(self._conn)
-            self._conn.enable_load_extension(False)
-            self._init_vec_table()
+            from backend.db.vector_schema import ensure_vector_schema, load_vector_extension
+            connection = open_dbapi_connection(f"sqlite:///{self.db_path}")
+            try:
+                load_vector_extension(connection)
+                connection.execute("PRAGMA busy_timeout=5000")
+                ensure_vector_schema(connection, self.embedding_dim)
+                connection.commit()
+            except BaseException:
+                connection.close()
+                raise
+            self._conn = connection
         return self._conn
     
     def _init_vec_table(self):
+        from backend.db.vector_schema import ensure_vector_schema
         conn = self._get_conn()
-        existing = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'"
-        ).fetchone()
-        if existing and f"FLOAT[{self.embedding_dim}]" not in (existing[0] or ""):
-            conn.execute("DROP TABLE chunks_vec")
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-                chunk_id TEXT PRIMARY KEY,
-                embedding FLOAT[{self.embedding_dim}],
-                collection_id TEXT,
-                document_id TEXT
-            )
-        """)
+        ensure_vector_schema(conn, self.embedding_dim)
         conn.commit()
     
     async def add_chunks(self, chunks_with_embeddings: List[ChunkWithEmbedding]) -> None:
@@ -140,7 +133,12 @@ class VectorStore:
         
         for row in cursor:
             chunk_id, distance, collection_id, document_id = row
-            score = 1.0 / (1.0 + distance)
+            # Both stored and query embeddings are unit-normalized above, so
+            # squared Euclidean distance is ``2 - 2 * cosine_similarity``.
+            # Expose a genuine 0..1 relevance score instead of compressing L2
+            # distance with 1/(1+d), which rejected useful BGE matches at the
+            # configured relevance threshold.
+            score = max(0.0, min(1.0, 1.0 - (float(distance) ** 2 / 2.0)))
             
             chunk = await self._get_chunk_details(chunk_id)
             if chunk:
@@ -166,10 +164,8 @@ class VectorStore:
     
     async def _get_chunk_details(self, chunk_id: str) -> Optional["Chunk"]:
         from backend.db.database import create_db_engine, get_session_factory
-        from backend.config import get_settings
         from backend.db.models import Chunk, Document
-        settings = get_settings()
-        engine = create_db_engine(settings.database_url)
+        engine = create_db_engine(f"sqlite:///{self.db_path}")
         Session = get_session_factory(engine)
         with Session() as session:
             return session.query(Chunk).join(Document).filter(

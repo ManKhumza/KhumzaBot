@@ -102,6 +102,43 @@ def test_embedding_runtime_batches_and_orders_vectors():
     assert vectors == [[1.0, 1.0], [2.0, 2.0]]
 
 
+def test_embedding_runtime_applies_query_prefix_only_to_queries():
+    """BGE-style retrieval instructions never contaminate stored passages."""
+    from backend.inference.lifecycle import ModelProvider
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [1.0, 0.0]}]}
+
+    class FakeClient:
+        def __init__(self):
+            self.inputs = []
+
+        async def post(self, _path, json):
+            self.inputs.append(json["input"])
+            return FakeResponse()
+
+    prefix = "Represent this sentence for searching relevant passages: "
+    client = FakeClient()
+    provider = ModelProvider(
+        model_id="bge", role="embedding", client=client, query_prefix=prefix
+    )
+
+    asyncio.run(provider.embed_batch(["stored herb passage"]))
+    asyncio.run(provider.embed_query("herb for headache"))
+
+    assert client.inputs == [
+        ["stored herb passage"],
+        [f"{prefix}herb for headache"],
+    ]
+
+
 def test_embedding_runtime_splits_oversized_inputs():
     """An oversized model-token sequence is embedded in pieces and recombined."""
     from backend.inference.lifecycle import ModelProvider

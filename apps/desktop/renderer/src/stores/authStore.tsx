@@ -2,6 +2,8 @@ import React from 'react';
 import { create } from 'zustand';
 import type { User, Session } from '@/types';
 import { nocaiAPI } from '@/utils/api';
+import { userFacingError, withTimeout } from '@/utils/errors';
+import { chatDrafts } from '@/stores/chatDrafts';
 
 interface AuthState {
   user: User | null;
@@ -26,7 +28,7 @@ export const useAuthStore = create<AuthState>()(
       error: null,
 
       login: async (username: string, password: string) => {
-        set({ isLoading: true, error: null });
+        set({ error: null });
         try {
           const result = await nocaiAPI.auth.login({ username, password });
           set({
@@ -36,7 +38,7 @@ export const useAuthStore = create<AuthState>()(
             isLoading: false,
           });
         } catch (error: any) {
-          set({ isLoading: false, error: error.message || 'Login failed' });
+          set({ isLoading: false, error: userFacingError(error, 'Sign-in failed. Try again.') });
           throw error;
         }
       },
@@ -45,7 +47,10 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true });
         try {
           await nocaiAPI.auth.logout();
+        } catch (error) {
+          set({ error: userFacingError(error, 'The backend could not confirm sign-out. Restart local services before signing in again.') });
         } finally {
+          chatDrafts.clear();
           set({
             user: null,
             session: null,
@@ -58,7 +63,7 @@ export const useAuthStore = create<AuthState>()(
       checkSession: async () => {
         set({ isLoading: true });
         try {
-          const session = await nocaiAPI.auth.getSession();
+          const session = await withTimeout(nocaiAPI.auth.getSession(), 'Session check timed out. Open diagnostics or retry local services.');
           if (session) {
             set({
               user: session.user,
@@ -69,13 +74,13 @@ export const useAuthStore = create<AuthState>()(
           } else {
             set({ user: null, session: null, isAuthenticated: false, isLoading: false });
           }
-        } catch {
-          set({ user: null, session: null, isAuthenticated: false, isLoading: false });
+        } catch (error) {
+          set({ user: null, session: null, isAuthenticated: false, isLoading: false, error: userFacingError(error) });
         }
       },
 
       changePassword: async (currentPassword: string, newPassword: string) => {
-        set({ isLoading: true, error: null });
+        set({ error: null });
         try {
           await nocaiAPI.auth.changePassword({ currentPassword, newPassword });
           set((state) => {
@@ -87,7 +92,7 @@ export const useAuthStore = create<AuthState>()(
             };
           });
         } catch (error: any) {
-          set({ isLoading: false, error: error.message || 'Password change failed' });
+          set({ isLoading: false, error: userFacingError(error, 'Password change failed.') });
           throw error;
         }
       },

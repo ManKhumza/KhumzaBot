@@ -69,3 +69,17 @@ def test_sparse_model_compatibility_is_normalized():
     assert compatibility["status"] == "COMPATIBLE"
     assert compatibility["warnings"] == []
     assert compatibility["reasons"] == []
+
+
+def test_qwen3_chat_runtime_disables_hidden_reasoning_for_responsiveness():
+    """CPU chat does not burn its response budget on Qwen3 thinking tokens."""
+    from backend.db.models import Model
+    from backend.inference.lifecycle import _role_specific_runtime_args
+
+    model = Model(
+        id="qwen3", name="Qwen3 4B", filename="Qwen3-4B-Q4_K_M.gguf",
+        filepath="model.gguf", size_bytes=1, role="chat",
+    )
+
+    assert _role_specific_runtime_args(model, "chat") == ["--reasoning", "off"]
+    assert _role_specific_runtime_args(model, "embedding") == []

@@ -1,495 +1,110 @@
-# NOC AI Assistant - Build Guide
+﻿# Windows build and verification
+
+Run commands below from the repository root in a normal PowerShell session. The authoritative entry points are [build-all.ps1](../scripts/build-all.ps1) for preparation and packaging and [quality-gate.ps1](../scripts/quality-gate.ps1) for independent verification. Building an installer does not establish that installation, upgrade, or uninstall passed; record those results separately using [release-verification.md](release-verification.md).
 
 ## Prerequisites
 
-### Development Environment
-- **Windows 10/11** (build host)
-- **Visual Studio 2022** with C++ workload
-- **Node.js 20+** (LTS)
-- **Python 3.11+**
-- **Git**
-- **CMake 3.22+**
-- **CUDA Toolkit 12.x** (optional, for GPU builds)
-- **Vulkan SDK** (optional, for GPU builds)
+- Windows x64 with an interactive desktop for Electron end-to-end tests.
+- Node.js 22.12.0 or newer, required by the pinned Electron dependency, with `npm.cmd` available.
+- Python 3.11 or newer to create the repository `.venv`; all subsequent Python development commands use that environment.
+- PowerShell; PowerShell 7 is recommended.
+- Network access for initial npm/pip dependencies and official runtime downloads. Application workflows use local services and models.
+- The bundled `resources/models/bge-small-en-v1.5-q8_0.gguf` and its attribution file. Its required SHA-256 is `f046db1dc724cf4f6f0a0c5917e922823b73eb1d27b8f9a9c2797f7866974804`.
+- A compatible, locally supplied GGUF chat fixture for the real desktop workflow. Set `NOC_AI_CHAT_TEST_MODEL` to its absolute path. The current fallback is `resources/models/Qwen3-4B-Q4_K_M.gguf`; a missing fixture fails the desktop test explicitly. The fixture is not included in release packages.
 
-### Required Tools
+For a fresh checkout, prepare dependencies and runtimes before the independent gate:
+
 ```powershell
-# Verify installations
-node --version        # v20.x.x
-npm --version         # 10.x.x
-python --version      # 3.11.x
-cmake --version       # 3.22+
-git --version
+.\scripts\build-all.ps1 -SkipPackaging
 ```
 
-## Repository Structure
-```
-noc-ai-assistant/
-├── apps/
-│   └── desktop/
-│       ├── electron/          # Electron main process
-│       ├── renderer/          # React frontend
-│       └── preload/           # IPC preload script
-├── backend/
-│   ├── main.py               # FastAPI entry point
-│   ├── config.py             # Settings
-│   ├── pyproject.toml        # Python dependencies
-│   └── nocai-backend.spec    # PyInstaller spec
-├── runtimes/
-│   └── llama/                # llama.cpp binaries
-├── resources/
-│   ├── icons/                # Application icons
-│   └── license.txt           # EULA
-├── scripts/
-│   ├── build-all.ps1         # Main build script
-│   └── download-llama.ps1    # llama.cpp downloader
-├── packaging/                # Installer configs
-└── docs/                     # Documentation
-```
+Set a chat fixture only when the fallback file is absent or another compatible local model is intended:
 
-## Building llama.cpp (Required First)
-
-### Windows Build (CPU Only)
-```cmd
-# Clone specific version
-git clone https://github.com/ggerganov/llama.cpp
-cd llama.cpp
-git checkout b4401  # Or desired version
-
-# Configure
-cmake -B build `
-  -DGGML_CUDA=OFF `
-  -DGGML_VULKAN=OFF `
-  -DCMAKE_BUILD_TYPE=Release
-
-# Build
-cmake --build build --config Release --target llama-server llama-cli
-
-# Copy to runtimes
-copy build\bin\Release\llama-server.exe ..\..\runtimes\llama\
-copy build\bin\Release\llama-cli.exe ..\..\runtimes\llama\
-copy build\bin\Release\*.dll ..\..\runtimes\llama\
-```
-
-### Windows Build (With CUDA)
-```cmd
-# Requires CUDA Toolkit 12.x
-cmake -B build `
-  -DGGML_CUDA=ON `
-  -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/bin/nvcc.exe" `
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build build --config Release --target llama-server llama-cli
-```
-
-### Windows Build (With Vulkan)
-```cmd
-# Requires Vulkan SDK
-cmake -B build `
-  -DGGML_VULKAN=ON `
-  -DVULKAN_SDK="C:/VulkanSDK/1.3.xxx" `
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build build --config Release --target llama-server llama-cli
-```
-
-### Full GPU Build (Recommended for Production)
-```cmd
-cmake -B build `
-  -DGGML_CUDA=ON `
-  -DGGML_VULKAN=ON `
-  -DGGML_OPENCL=ON `
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build build --config Release --target llama-server llama-cli
-```
-
-### Verify Binaries
 ```powershell
-# Test llama-server
-.\runtimes\llama\llama-server.exe --help
-
-# Should show version and available backends
-# Look for: CUDA, Vulkan, OpenCL, Metal support indicators
+$env:NOC_AI_CHAT_TEST_MODEL = 'C:\TestModels\compatible-chat.gguf'
 ```
 
-## Building Backend (Python)
+The supplied path must exist. Choose a small model that can complete on the test machine within the workflow's bounded timeouts. Do not use the real `%APPDATA%\NOC AI Assistant` profile, existing credentials, or private documents as fixtures. The automated desktop harness creates temporary profiles and strips inherited application secrets and profile overrides.
 
-### Development Setup
+CI uses Node 24 and the same preparation command. Its runner must have the local chat fixture provisioned before verification; the `NOC_AI_CHAT_TEST_MODEL` repository variable selects its path. A standard hosted runner without that fixture fails the prerequisite check explicitly.
+
+## Verify and package
+
+Run the independent development gate after preparation:
+
 ```powershell
-cd backend
-
-# Create virtual environment
-python -m venv .venv
-.\.venv\Scripts\activate
-
-# Install dependencies
-pip install -e ".[dev]"
-pip install pyinstaller
+.\scripts\quality-gate.ps1
 ```
 
-### Run in Development
+For release verification, rebuild the package, test its executable, and run the required extended workflow soak:
+
 ```powershell
-# Set required env vars
-$env:NOC_AI_SESSION_TOKEN = "test-token-123"
-$env:NOC_AI_DATA_DIR = "C:\temp\nocai-test"
-
-# Run
-python main.py --port 8080 --token test-token-123 --data-dir "C:\temp\nocai-test"
+.\scripts\quality-gate.ps1 -Package -SoakMinutes 60
 ```
 
-### Build Executable with PyInstaller
+The gate records results in `.artifacts/nemotron/quality-report.json` and logs in its sibling `gate-logs` directory. Check the exit code, report generation time and requested options, and every gate result. A historical passing report is not evidence for newer source or artifacts. `-ReportPath` can preserve a separate run's report and logs. A release requires all gates to pass and the Windows lifecycle results in the release checklist.
+
+The gate checks resource integrity and security configuration, Python compilation and required coverage inventory, the backend suite, renderer typecheck/build, Electron TypeScript build, and real desktop workflows. `-Package` additionally invokes the clean build, package verification, and workflows against `release/win-unpacked/NOC AI Assistant.exe`. The packaged workflow uses the embedded backend and bundled BGE resource. It does not run the NSIS installer or portable launcher.
+
+With `-Package -SoakMinutes 60`, source desktop checks use the short CI cycles and the packaged workflow runs the 60-minute soak. Without `-Package`, the requested soak duration applies to source desktop checks. Resource snapshots are written as `workflow-resource-snapshots.json` under `.artifacts/desktop-tests`; preserve them before the next Playwright run.
+
+To produce unsigned development artifacts directly:
+
 ```powershell
-# Build using spec file
-.\.venv\Scripts\pyinstaller.exe nocai-backend.spec --clean --noconfirm
-
-# Output: ../apps/desktop/electron/dist/backend/nocai-backend.exe
+.\scripts\build-all.ps1
 ```
 
-### Verify Executable
+`build-all.ps1` refreshes the embedded Python backend from authoritative source even when the base interpreter is cached. It installs constrained Python dependencies and locked npm dependencies, builds both desktop projects, clears only the dedicated release output, packages, then generates and verifies checksums and the release manifest. Runtime versions and archive hashes are pinned in [runtime-lock.json](../resources/runtime-lock.json). Do not patch `backend/build`, `dist`, `runtimes/python/Lib/site-packages/backend`, or packaged files as a source fix.
+
+`VERSION` is authoritative. Package metadata, lockfile roots, backend package/API version, and artifact filenames must agree with it. Do not use the build script's skip switches as evidence of a clean release.
+
+## Release outputs and integrity
+
+Artifacts are under `apps/desktop/electron/release`:
+
+| File | Purpose |
+| --- | --- |
+| `NOC-AI-Assistant-Setup-<VERSION>.exe` | NSIS installer |
+| `NOC-AI-Assistant-Portable-<VERSION>.exe` | Portable launcher |
+| `SHA256SUMS.txt` | Checksums generated after packaging/signing |
+| `RELEASE-INFO.json` | Version, build ID, distribution label, source and package hashes, artifact sizes |
+| `win-unpacked/` | Packaged application used by automated desktop verification |
+
+The package contains the embedding model, embedded Python, and llama.cpp. It does not bundle a chat model. Check a finished unsigned build with:
+
 ```powershell
-# Test standalone executable
-$env:NOC_AI_SESSION_TOKEN = "test-token-123"
-$env:NOC_AI_DATA_DIR = "C:\temp\nocai-test"
-.\dist\nocai-backend.exe --port 8081 --token test-token-123 --data-dir "C:\temp\nocai-test"
+.\scripts\verify-packaging.ps1 -InstallerPath apps/desktop/electron/release
+.\.venv\Scripts\python.exe scripts/release_integrity.py --release apps/desktop/electron/release
 ```
 
-## Building Frontend (React/TypeScript)
+The integrity checker rejects unexpected or mixed-version executable artifacts, stale checksums, missing resources, a stale packaged backend, and source/package differences from the manifest. Keep the manifest and verification report with distributed artifacts. Do not regenerate the manifest just to conceal an unexplained mismatch.
 
-### Development Setup
+## Signed release
+
+Unsigned output is labeled `unsigned-development`. A signed release requires a user-owned, trusted code-signing certificate with an accessible private key. Keep Windows security enabled and use an appropriately trusted certificate for the intended distribution.
+
+Configure either `NOC_AI_CERT_THUMBPRINT` for a certificate available through the Windows certificate store, or `NOC_AI_CERT_PFX` and `NOC_AI_CERT_PASSWORD` for a user-supplied PFX. Supply passwords through the process environment without putting them in source, scripts, logs, or command arguments. Do not configure both certificate methods.
+
 ```powershell
-cd apps\desktop\renderer
-
-# Install dependencies
-npm ci
-
-# Start dev server
-npm run dev
-# Runs on http://localhost:5173
+.\scripts\sign-windows.ps1 -Preflight
+.\scripts\build-all.ps1 -Sign
+.\scripts\verify-packaging.ps1 -InstallerPath apps/desktop/electron/release -RequireSignature
 ```
 
-### Type Checking
+The preflight fails if signing material is unavailable or unsuitable. The signing script preserves existing valid signatures and signs remaining EXE, DLL, and PYD files; the Electron builder hook also signs the app, installer, and uninstaller. Verification with `-RequireSignature` requires valid Authenticode status for all enumerated code files. Timestamping requires access to the configured timestamp service.
+
+The signed build produces new artifacts and hashes. Repeat packaged desktop smoke verification for those artifacts, retain signature results, and verify the installed uninstaller in the disposable Windows lifecycle test. `quality-gate.ps1 -Package` builds unsigned development output; do not run it over completed signed artifacts and report the result as signed verification.
+
+## Focused diagnosis
+
+These commands help reproduce a failure; they do not replace the full gate:
+
 ```powershell
-npm run typecheck
+.\.venv\Scripts\python.exe -m pytest -q tests
+npm.cmd run typecheck --prefix apps/desktop/renderer
+npm.cmd run build --prefix apps/desktop/renderer
+npm.cmd run build --prefix apps/desktop/electron
+npm.cmd run test:e2e --prefix apps/desktop/electron
 ```
 
-### Linting
-```powershell
-npm run lint
-```
-
-### Production Build
-```powershell
-npm run build
-# Output: ../dist/renderer/
-```
-
-## Building Electron Application
-
-### Development Setup
-```powershell
-cd apps\desktop\electron
-
-# Install dependencies
-npm ci
-```
-
-### Development Mode
-```powershell
-# Terminal 1: Frontend dev server
-cd ..\renderer
-npm run dev
-
-# Terminal 2: Electron
-cd ..\electron
-npm run dev
-```
-
-### Package Application
-```powershell
-cd apps\desktop\electron
-
-# Set version
-$version = "1.0.0"
-$packageJson = Get-Content package.json | ConvertFrom-Json
-$packageJson.version = $version
-$packageJson | ConvertTo-Json -Depth 10 | Set-Content package.json
-
-# Build for Windows x64
-npx electron-builder --win --x64 --config builder.yaml
-
-# Output: dist/
-# - NOC-AI-Assistant-Setup-<version>.exe
-# - NOC-AI-Assistant-Portable-<version>.zip
-```
-
-## Complete Build Process
-
-### Automated Build Script
-```powershell
-# From project root
-.\scripts\build-all.ps1 -Version "1.0.0"
-
-# Options:
-# -SkipBackend       Skip backend build
-# -SkipFrontend      Skip frontend build
-# -SkipPackaging     Skip electron-builder
-```
-
-### Manual Step-by-Step
-```powershell
-# 1. Build llama.cpp (one-time)
-.\scripts\download-llama.ps1
-# OR build manually (see above)
-
-# 2. Build backend
-cd backend
-.\.venv\Scripts\pyinstaller.exe nocai-backend.spec --clean --noconfirm
-cd ..
-
-# 3. Build frontend
-cd apps\desktop\renderer
-npm ci
-npm run build
-cd ..\..
-
-# 4. Package Electron
-cd apps\desktop\electron
-npm ci
-npx electron-builder --win --x64 --config builder.yaml
-cd ..\..
-
-# 5. Generate checksums
-$dist = "apps\desktop\electron\dist"
-$files = Get-ChildItem $dist -Filter "*.exe", "*.zip" | Where-Object { -not $_.Name.Contains("blockmap") }
-$checksums = @()
-foreach ($file in $files) {
-    $hash = Get-FileHash -Path $file.FullName -Algorithm SHA256
-    $checksums += "$($hash.Hash)  $($file.Name)"
-}
-$checksums -join "`n" | Set-Content "$dist\SHA256SUMS.txt"
-```
-
-## Build Artifacts
-
-### Expected Output
-```
-apps/desktop/electron/dist/
-├── NOC-AI-Assistant-Setup-1.0.0.exe      # NSIS Installer (~150-200 MB)
-├── NOC-AI-Assistant-Portable-1.0.0.zip   # Portable (~150-200 MB)
-├── SHA256SUMS.txt                        # Checksums
-└── latest.yml                            # Auto-update (disabled)
-```
-
-### Artifact Verification
-```powershell
-# Verify checksums
-Get-Content "apps\desktop\electron\dist\SHA256SUMS.txt"
-
-# Verify installer
-# 1. Run installer on clean VM
-# 2. Check Start Menu shortcut
-# 3. Verify app launches
-# 4. Check backend starts
-# 4. Test model loading
-```
-
-## CI/CD Pipeline (GitHub Actions Example)
-
-```yaml
-# .github/workflows/build.yml
-name: Build Windows
-
-on:
-  push:
-    tags: ['v*']
-
-jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 60
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        cache: 'npm'
-        cache-dependency-path: apps/desktop/renderer/package-lock.json
-    
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
-        cache-dependency-path: backend/pyproject.toml
-    
-    - name: Install Visual Studio Build Tools
-      uses: microsoft/setup-msbuild@v2
-    
-    - name: Install CMake
-      uses: jwlawson/actions-setup-cmake@v2
-      with:
-        cmake-version: '3.28'
-    
-    - name: Install CUDA (optional)
-      # Add CUDA setup if needed
-    
-    - name: Build llama.cpp
-      run: |
-        cd runtimes/llama
-        # ... build commands
-    
-    - name: Build Backend
-      run: |
-        cd backend
-        python -m venv .venv
-        .venv\Scripts\pip install -e ".[dev]"
-        .venv\Scripts\pip install pyinstaller
-        .venv\Scripts\pyinstaller nocai-backend.spec --clean --noconfirm
-    
-    - name: Build Frontend
-      run: |
-        cd apps/desktop/renderer
-        npm ci
-        npm run build
-    
-    - name: Package Electron
-      run: |
-        cd apps/desktop/electron
-        npm ci
-        npx electron-builder --win --x64 --config builder.yaml
-    
-    - name: Generate Checksums
-      run: |
-        $dist = "apps/desktop/electron/dist"
-        $files = Get-ChildItem $dist -Filter "*.exe", "*.zip" | Where-Object { -not $_.Name.Contains("blockmap") }
-        $checksums = @()
-        foreach ($file in $files) {
-            $hash = Get-FileHash -Path $file.FullName -Algorithm SHA256
-            $checksums += "$($hash.Hash)  $($file.Name)"
-        }
-        $checksums -join "`n" | Set-Content "$dist\SHA256SUMS.txt"
-    
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: release-artifacts
-        path: apps/desktop/electron/dist/*
-        retention-days: 30
-    
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          apps/desktop/electron/dist/NOC-AI-Assistant-Setup-${{ github.ref_name }}.exe
-          apps/desktop/electron/dist/NOC-AI-Assistant-Portable-${{ github.ref_name }}.zip
-          apps/desktop/electron/dist/SHA256SUMS.txt
-        generate_release_notes: true
-```
-
-## Code Signing (Production)
-
-### Certificate Setup
-```powershell
-# 1. Obtain code signing certificate (EV preferred)
-# 2. Export to .pfx
-# 3. Store securely (Azure Key Vault, GitHub Secrets)
-
-# Configure in builder.yaml:
-# win:
-#   certificateFile: ${{ secrets.CERT_FILE }}
-#   certificatePassword: ${{ secrets.CERT_PASSWORD }}
-```
-
-### Signtool Verification
-```powershell
-# Verify signature
-signtool verify /pa /v "NOC-AI-Assistant-Setup-1.0.0.exe"
-
-# Timestamp verification
-signtool verify /pa /v /tr http://timestamp.digicert.com "NOC-AI-Assistant-Setup-1.0.0.exe"
-```
-
-## Troubleshooting Build Issues
-
-### PyInstaller Errors
-| Error | Fix |
-|-------|-----|
-| `ModuleNotFoundError` | Add to `hidden-imports` in spec |
-| `DLL load failed` | Add to `binaries` or `datas` in spec |
-| `Permission denied` | Run as Administrator |
-| `File too large` | Use `--upx-dir` or disable UPX |
-
-### Electron Builder Errors
-| Error | Fix |
-|-------|-----|
-| `Code signing failed` | Check certificate, password |
-| `NSIS error` | Check installer.nsh syntax |
-| `File not found` | Verify `extraResources` paths |
-| `asar integrity` | Run `npm run build` first |
-
-### Frontend Build Errors
-| Error | Fix |
-|-------|-----|
-| `TypeScript errors` | Run `npm run typecheck` |
-| `Tailwind not working` | Check `content` paths in tailwind.config.js |
-| `Module not found` | Check `base: './'` in vite.config.ts |
-
-## Build Performance
-
-### Parallel Builds
-```powershell
-# Build backend and frontend simultaneously
-Start-Job { cd backend; .\.venv\Scripts\pyinstaller.exe nocai-backend.spec }
-Start-Job { cd apps\desktop\renderer; npm run build }
-Wait-Job *
-```
-
-### Incremental Builds
-- Frontend: `npm run build` uses Vite cache
-- Backend: PyInstaller caches bytecode
-- Electron: electron-builder caches node_modules
-
-### Clean Build
-```powershell
-# Full clean
-Remove-Item "apps/desktop/renderer/node_modules" -Recurse -Force
-Remove-Item "apps/desktop/renderer/dist" -Recurse -Force
-Remove-Item "backend/.venv" -Recurse -Force
-Remove-Item "backend/dist" -Recurse -Force
-Remove-Item "backend/build" -Recurse -Force
-Remove-Item "apps/desktop/electron/dist" -Recurse -Force
-Remove-Item "apps/desktop/electron/node_modules" -Recurse -Force
-```
-
-## Version Management
-
-### Version Format
-- Semantic Versioning: `MAJOR.MINOR.PATCH`
-- Example: `1.0.0`, `1.1.0`, `1.1.1`
-
-### Updating Version
-```powershell
-# Update all package.json files
-$version = "1.0.2"
-
-# Root (if exists)
-# Apps/desktop/renderer/package.json
-# Apps/desktop/electron/package.json
-# Backend/pyproject.toml
-```
-
-### Release Checklist
-- [ ] Version bumped in all locations
-- [ ] Changelog updated
-- [ ] All tests pass
-- [ ] Clean build completed
-- [ ] Checksums generated
-- [ ] Installer tested on clean VM
-- [ ] Portable tested
-- [ ] Code signed (production)
-- [ ] Release notes written
-- [ ] GitHub release created
+Electron uses its `build` script for TypeScript checking. Read the failing gate's log, reproduce against an isolated profile, fix authoritative source with a regression test, and rerun the gate. Record a missing external prerequisite with the exact failed command and sanitized error.

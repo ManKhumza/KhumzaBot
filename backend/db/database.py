@@ -3,7 +3,7 @@ from sqlalchemy import (
     ForeignKey, Index, LargeBinary, JSON, event
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import StaticPool, QueuePool
 from sqlalchemy.engine import make_url
 import uuid
 import logging
@@ -300,8 +300,9 @@ def _create_db_engine(database_url: str, encryption_key_hex: str | None = None):
         engine = create_engine(
             database_url,
             connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+            poolclass=StaticPool if make_url(database_url).database in (None, "", ":memory:") else QueuePool,
             echo=False,
+            hide_parameters=True,
         )
     else:
         db_path = make_url(database_url).database
@@ -311,8 +312,9 @@ def _create_db_engine(database_url: str, encryption_key_hex: str | None = None):
         engine = create_engine(
             "sqlite://",
             creator=lambda: get_connection(db_path, encryption_key),
-            poolclass=StaticPool,
+            poolclass=QueuePool,
             echo=False,
+            hide_parameters=True,
         )
     
     @event.listens_for(engine, "connect")

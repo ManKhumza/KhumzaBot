@@ -117,11 +117,13 @@ def test_settings_api_round_trip(tmp_path, monkeypatch):
 
 def test_settings_immutable_copies(tmp_path):
     """Settings: changes use fresh immutable copies, not in-place JSON mutation."""
-    from backend.config import Settings
-    
-    # Settings class should handle immutability properly
-    settings = Settings()
-    # Check that settings can be created and have expected attributes
-    assert hasattr(settings, 'database_url')
-    assert hasattr(settings, 'models_dir')
-    assert hasattr(settings, 'knowledge_dir')
+    from backend.api.routes import DEFAULT_SETTINGS, _merge_settings
+    from copy import deepcopy
+    original = deepcopy(DEFAULT_SETTINGS)
+    changed = _merge_settings(DEFAULT_SETTINGS, {"appearance": {"compactMode": True}})
+    changed["behavior"]["maxSources"] = 1
+    fresh = _merge_settings(DEFAULT_SETTINGS, {})
+    assert DEFAULT_SETTINGS == original
+    assert fresh == original
+    assert changed["appearance"]["compactMode"] is True
+    assert changed["behavior"]["maxSources"] != fresh["behavior"]["maxSources"]

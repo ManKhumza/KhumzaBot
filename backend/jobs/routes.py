@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from typing import Optional
 from backend.auth.dependencies import get_db, get_current_user, require_permission
-from backend.db.models import IngestionJob, User
+from backend.db.models import IngestionJob, User, Document
 
 router = APIRouter(tags=["jobs"])
 
@@ -79,6 +79,10 @@ async def retry_job(
     job.completed_at = None
     job.current_stage = "queued"
     job.progress = 0
+    document = db.get(Document, job.document_id)
+    if document:
+        document.status = "queued"
+        document.error_message = None
     db.commit()
     await request.app.state.ingestion.enqueue(job.id)
     return {"success": True}
@@ -98,5 +102,9 @@ async def cancel_job(
     job.current_stage = "cancelled"
     job.error_message = "Cancelled by user"
     job.completed_at = datetime.utcnow()
+    document = db.get(Document, job.document_id)
+    if document:
+        document.status = "cancelled"
+        document.error_message = "Ingestion cancelled; retry to index this document"
     db.commit()
     return {"success": True}

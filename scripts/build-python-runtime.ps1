@@ -2,15 +2,18 @@
 <# Build a portable backend runtime around Python's official Windows embed package. #>
 
 param(
-    [string]$PythonVersion = "3.11.9",
+    [string]$PythonVersion,
     [string]$OutputDir = "runtimes\python"
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path (Split-Path -Parent $PSScriptRoot)).Path
+$RuntimeLock = Get-Content -LiteralPath (Join-Path $ProjectRoot 'resources\runtime-lock.json') -Raw | ConvertFrom-Json
+if ($PythonVersion -and $PythonVersion -ne $RuntimeLock.python.version) { throw 'Python version must match resources/runtime-lock.json.' }
+$PythonVersion = $RuntimeLock.python.version
 $OutputPath = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $OutputDir))
-if (-not $OutputPath.StartsWith($ProjectRoot + [System.IO.Path]::DirectorySeparatorChar)) {
-    throw "Python runtime output must remain inside the project."
+if ($OutputPath -ne (Join-Path $ProjectRoot 'runtimes\python')) {
+    throw "Python runtime output must be the dedicated runtimes/python directory."
 }
 
 $VirtualPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
@@ -35,11 +38,18 @@ if ($NeedsBootstrap) {
 
     Write-Host "Downloading official Python $PythonVersion embedded runtime..." -ForegroundColor Cyan
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $Archive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -ne $RuntimeLock.python.sha256) {
+        throw 'Official embedded Python archive SHA-256 does not match the pinned runtime lock.'
+    }
     Expand-Archive -LiteralPath $Archive -DestinationPath $OutputPath -Force
+    if ((Get-AuthenticodeSignature -LiteralPath $EmbeddedPython).Status -ne 'Valid') {
+        throw 'Official embedded Python signature is not valid.'
+    }
 
     $PthFile = Get-ChildItem -LiteralPath $OutputPath -Filter "python*._pth" | Select-Object -First 1
     if (-not $PthFile) { throw "Python embedded path configuration was not found." }
-    Set-Content -LiteralPath $PthFile.FullName -Encoding ascii -Value @("python311.zip", ".", "Lib\site-packages", "import site")
+    $PythonTag = (($PythonVersion -split '\.')[0..1] -join '')
+    Set-Content -LiteralPath $PthFile.FullName -Encoding ascii -Value @("python$PythonTag.zip", ".", "Lib\site-packages", "import site")
 }
 
 $SitePackages = Join-Path $OutputPath "Lib\site-packages"
@@ -58,7 +68,7 @@ try {
     if (-not $BackendWheel) { throw "The backend runtime wheel was not produced." }
 
     # Without --python, a newer host Python can silently install incompatible ABI wheels.
-    & $VirtualPython -m pip --python $EmbeddedPython install --disable-pip-version-check --no-compile --upgrade --target $SitePackages $BackendWheel.FullName
+    & $VirtualPython -m pip --python $EmbeddedPython install --disable-pip-version-check --no-compile --upgrade --only-binary=:all: -c (Join-Path $ProjectRoot 'backend\constraints-windows.txt') --target $SitePackages $BackendWheel.FullName
     if ($LASTEXITCODE -ne 0) { throw "Installing backend runtime dependencies failed." }
 } finally {
     if (Test-Path -LiteralPath $WheelDirectory) {

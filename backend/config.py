@@ -3,12 +3,13 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 from functools import lru_cache
+from backend.version import __version__
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="NOC_AI_", extra="ignore")
     # App
     app_name: str = "NOC AI Assistant"
-    version: str = "1.0.2"
+    version: str = __version__
     debug: bool = False
     
     # Data directories

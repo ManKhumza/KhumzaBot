@@ -9,6 +9,7 @@ import { Dialog, AlertDialog } from '@/components/common/Dialog';
 import { Plus, Trash2, Play, Pause, Cpu, HardDrive, Download, Upload, Search, Loader2, AlertTriangle, CheckCircle, X } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { Model, HardwareInfo, ResourceEstimate } from '@/types';
+import { userFacingError } from '@/utils/errors';
 
 export const Models = () => {
   const { user } = useAuthStore();
@@ -28,12 +29,14 @@ export const Models = () => {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [activatingId, setActivatingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
   }, []);
 
   const loadData = async () => {
+    setError(null);
     try {
       const [modelsData, hardwareData] = await Promise.all([
         nocaiAPI.models.listModels(),
@@ -44,7 +47,7 @@ export const Models = () => {
       setEmbeddingModels(modelsData.filter(m => m.role === 'embedding'));
       setHardware(hardwareData);
     } catch (error) {
-      console.error('Failed to load models:', error);
+      setError(userFacingError(error, 'Could not load models. Retry when local services are ready.'));
     } finally {
       setLoading(false);
     }
@@ -58,10 +61,19 @@ export const Models = () => {
       setScanResults(results.models);
       setShowScanResults(true);
     } catch (error) {
-      console.error('Scan failed:', error);
+      setError(userFacingError(error, 'Model scan failed. Check the directory and retry.'));
     } finally {
       setScanning(false);
     }
+  };
+
+  const browseModel = async (directory = false) => {
+    try {
+      const selected = directory
+        ? await window.nocai.dialog.openDirectory()
+        : (await window.nocai.dialog.openFiles({ title: 'Choose GGUF model', filters: [{ name: 'GGUF model', extensions: ['gguf'] }] }))[0];
+      if (selected) setImportPath(selected);
+    } catch (failure) { setError(userFacingError(failure, 'Could not open the model picker.')); }
   };
 
   const handleImport = async () => {
@@ -78,7 +90,7 @@ export const Models = () => {
       setImportName('');
       await loadData();
     } catch (error) {
-      console.error('Import failed:', error);
+      setError(userFacingError(error, 'Model import failed. Check the file and retry.'));
     } finally {
       setImporting(false);
     }
@@ -90,7 +102,7 @@ export const Models = () => {
       await nocaiAPI.models.activateModel(modelId, role);
       await loadData();
     } catch (error) {
-      console.error('Activate failed:', error);
+      setError(userFacingError(error, 'The model did not become ready. Open diagnostics for details.'));
     } finally {
       setActivatingId(null);
     }
@@ -101,7 +113,7 @@ export const Models = () => {
       await nocaiAPI.models.deactivateModel(modelId);
       await loadData();
     } catch (error) {
-      console.error('Deactivate failed:', error);
+      setError(userFacingError(error, 'The model could not be stopped.'));
     }
   };
 
@@ -110,7 +122,7 @@ export const Models = () => {
       await nocaiAPI.models.deleteModel(modelId);
       await loadData();
     } catch (error) {
-      console.error('Delete failed:', error);
+      setError(userFacingError(error, 'The model could not be deleted.'));
     } finally {
       setShowDeleteConfirm(false);
       setDeletingId(null);
@@ -146,6 +158,7 @@ export const Models = () => {
 
   return (
     <div className="space-y-6">
+      {error && <div role="alert" className="relative z-[60] flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/30 bg-card p-4 text-sm text-destructive"><span>{error}</span><Button variant="outline" onClick={() => void loadData()}>Refresh models</Button></div>}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -283,9 +296,10 @@ export const Models = () => {
       <Dialog open={showImportDialog} onOpenChange={setShowImportDialog} title="Import Model" description="Select a local GGUF model file or scan a directory">
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium mb-1">Model Directory</label>
+            <label htmlFor="model-import-path" className="block text-sm font-medium mb-1">Model file or directory</label>
             <div className="flex gap-2">
               <Input
+                id="model-import-path"
                 value={importPath}
                 onChange={(e) => setImportPath(e.target.value)}
                 placeholder="C:\\Models or /home/user/models"
@@ -295,6 +309,7 @@ export const Models = () => {
                 Scan
               </Button>
             </div>
+            <div className="mt-2 flex gap-2"><Button variant="outline" onClick={() => void browseModel()}>Choose file</Button><Button variant="outline" onClick={() => void browseModel(true)}>Choose folder</Button></div>
           </div>
 
           {showScanResults && scanResults.length > 0 && (

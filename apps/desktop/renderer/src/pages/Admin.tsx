@@ -10,6 +10,7 @@ import { Dialog, AlertDialog } from '@/components/common/Dialog';
 import { Plus, Trash2, Users, Shield, Activity, HardDrive, Monitor, Loader2, Search, Edit2, Key } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { User, Role, AuditEntry, HealthStatus, JobProgress } from '@/types';
+import { userFacingError } from '@/utils/errors';
 
 type AdminTab = 'users' | 'roles' | 'audit' | 'jobs' | 'health';
 
@@ -24,6 +25,7 @@ export const Admin = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<AdminTab>(() => adminTabFromPath(location.pathname));
+  const [error, setError] = useState<string | null>(null);
   
   // Users
   const [users, setUsers] = useState<User[]>([]);
@@ -59,7 +61,7 @@ export const Admin = () => {
       const data = await nocaiAPI.admin.listUsers();
       setUsers(data);
     } catch (error) {
-      console.error('Failed to load users:', error);
+      setError(userFacingError(error, 'Could not load users.'));
     } finally {
       setUsersLoading(false);
     }
@@ -71,7 +73,7 @@ export const Admin = () => {
       const data = await nocaiAPI.admin.listRoles();
       setRoles(data);
     } catch (error) {
-      console.error('Failed to load roles:', error);
+      setError(userFacingError(error, 'Could not load roles.'));
     } finally {
       setRolesLoading(false);
     }
@@ -83,7 +85,7 @@ export const Admin = () => {
       const data = await nocaiAPI.admin.getAuditLog(auditFilters);
       setAuditLogs(data);
     } catch (error) {
-      console.error('Failed to load audit:', error);
+      setError(userFacingError(error, 'Could not load audit events.'));
     } finally {
       setAuditLoading(false);
     }
@@ -95,7 +97,7 @@ export const Admin = () => {
       const data = await nocaiAPI.admin.getJobs(jobsFilters);
       setJobs(data);
     } catch (error) {
-      console.error('Failed to load jobs:', error);
+      setError(userFacingError(error, 'Could not load ingestion jobs.'));
     } finally {
       setJobsLoading(false);
     }
@@ -107,7 +109,7 @@ export const Admin = () => {
       const data = await nocaiAPI.admin.getHealth();
       setHealth(data);
     } catch (error) {
-      console.error('Failed to load health:', error);
+      setError(userFacingError(error, 'Could not load component health.'));
     } finally {
       setHealthLoading(false);
     }
@@ -134,7 +136,7 @@ export const Admin = () => {
       setNewUser({ username: '', password: '', displayName: '', email: '', roles: ['operator'] });
       await loadUsers();
     } catch (error) {
-      console.error('Failed to create user:', error);
+      setError(userFacingError(error, 'Could not create the user.'));
     } finally {
       setCreatingUser(false);
     }
@@ -152,7 +154,7 @@ export const Admin = () => {
       setEditingUser(null);
       await loadUsers();
     } catch (error) {
-      console.error('Failed to update user:', error);
+      setError(userFacingError(error, 'Could not update the user.'));
     }
   };
 
@@ -161,7 +163,7 @@ export const Admin = () => {
       await nocaiAPI.admin.deleteUser(userId);
       await loadUsers();
     } catch (error) {
-      console.error('Failed to delete user:', error);
+      setError(userFacingError(error, 'Could not delete the user.'));
     } finally {
       setShowDeleteUserConfirm(false);
       setDeletingUserId(null);
@@ -178,6 +180,7 @@ export const Admin = () => {
 
   return (
     <div className="space-y-6">
+      {error && <div role="alert" className="relative z-[60] flex items-start justify-between gap-3 rounded-md border border-destructive/30 bg-card p-4 text-sm text-destructive"><span>{error}</span><Button variant="ghost" onClick={() => setError(null)}>Dismiss</Button></div>}
       <div>
         <h1 className="text-2xl font-bold text-foreground">Administration</h1>
         <p className="text-muted-foreground">System administration and monitoring</p>

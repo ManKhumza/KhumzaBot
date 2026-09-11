@@ -33,18 +33,35 @@ REQUIRED_CATEGORIES: dict[str, tuple[str, ...]] = {
 }
 
 
-def discover_test_evidence() -> tuple[list[str], list[str]]:
+def discover_test_evidence(test_root: Path = TEST_ROOT) -> tuple[list[str], list[str]]:
     names: list[str] = []
     parse_errors: list[str] = []
-    for path in sorted(TEST_ROOT.rglob("test_*.py")):
+    for path in sorted(test_root.rglob("test_*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (OSError, SyntaxError, UnicodeError) as exc:
-            parse_errors.append(f"{path.relative_to(ROOT)}: {exc}")
+            parse_errors.append(f"{path.name}: {exc}")
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
                 docstring = ast.get_docstring(node) or ""
+                checks = [item for item in ast.walk(node) if isinstance(item, ast.Assert)]
+                checked_calls = [
+                    item for item in ast.walk(node)
+                    if isinstance(item, ast.Call) and (
+                        (isinstance(item.func, ast.Attribute) and item.func.attr in {"raises", "check_call", "check_output"})
+                        or any(arg.arg == "check" and isinstance(arg.value, ast.Constant) and arg.value.value is True for arg in item.keywords)
+                    )
+                ]
+                if not checks and not checked_calls:
+                    parse_errors.append(f"{path.name}:{node.lineno}: {node.name} has no executable outcome assertion")
+                    continue
+                if checks and not checked_calls and all(
+                    isinstance(item.test, ast.Call) and isinstance(item.test.func, ast.Name)
+                    and item.test.func.id == "hasattr" for item in checks
+                ):
+                    parse_errors.append(f"{path.name}:{node.lineno}: {node.name} only checks method existence")
+                    continue
                 names.append(f"{path.stem}.{node.name} {docstring}".lower())
     return names, parse_errors
 

@@ -27,6 +27,21 @@ def test_typescript_preload_compiles() -> None:
     )
 
 
+def test_packaged_preload_has_no_local_runtime_imports() -> None:
+    """A sandboxed packaged preload must be a self-contained runtime module."""
+    preload_text = (DESKTOP_DIR / "preload" / "preload.ts").read_text(encoding="utf-8")
+
+    runtime_imports = re.findall(
+        r"^import\s+(?!type\b).*?from\s+['\"](?:\.|/)",
+        preload_text,
+        flags=re.MULTILINE,
+    )
+    local_requires = re.findall(r"require\(['\"](?:\.|/)", preload_text)
+
+    assert not runtime_imports, f"Sandboxed preload has local runtime imports: {runtime_imports}"
+    assert not local_requires, f"Sandboxed preload has local require calls: {local_requires}"
+
+
 def test_backend_routes_exist_for_electron() -> None:
     """Verify the HTTP methods and paths used by Electron exist in FastAPI."""
     from backend.main import create_app

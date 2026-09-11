@@ -1,4 +1,7 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, session } from 'electron';
+import { app, BrowserWindow, ipcMain as electronIpcMain, dialog, shell, session } from 'electron';
+import { BackendSupervisor } from './backend-supervisor';
+import { DiagnosticJournal, sanitizeDiagnostic } from './diagnostics';
+import { assertTrustedSender, isTrustedRendererUrl, validateDirectoryToOpen, validateExternalUrl, validateProfileOverride, validateProxyRequest } from './security-policy';
 import { IPC } from '../shared/ipc-contract';
 import type {
   ChatLoadPayload,
@@ -7,11 +10,16 @@ import type {
   RenamePayload,
   ReprocessPayload,
 } from '../shared/ipc-contract';
-import { basename, join } from 'path';
+import { basename, extname, isAbsolute, join, resolve } from 'path';
 import { spawn, SpawnOptions } from 'child_process';
 import { randomBytes } from 'crypto';
 import { existsSync, statSync } from 'fs';
+import { pathToFileURL } from 'url';
 const isDev = !app.isPackaged;
+const isolatedProfile = process.env.NOC_AI_TEST_PROFILE || process.env.NOC_AI_DATA_DIR;
+if (isolatedProfile) app.setPath('userData', validateProfileOverride(isolatedProfile));
+const useDevServer = isDev && process.env.NOC_AI_SMOKE_TEST !== '1';
+const rendererUrl = useDevServer ? 'http://localhost:5173/' : pathToFileURL(join(__dirname, '../renderer/index.html')).href;
 
 let mainWindow: BrowserWindow | null = null;
 let backendProcess: ReturnType<typeof spawn> | null = null;
@@ -23,6 +31,61 @@ let lastRendererRecoveryAt = 0;
 let unresponsiveDialogOpen = false;
 let backendStartupPromise: Promise<void> | null = null;
 const nativeFetch = globalThis.fetch;
+let journal: DiagnosticJournal | null = null;
+let loggingFailed = false;
+const activeGenerations = new Map<string, AbortController>();
+const approvedReadPaths = new Map<string, number>();
+const approvedWritePaths = new Map<string, number>();
+
+function rememberNativePath(map: Map<string, number>, path: string): void {
+  if (!isAbsolute(path)) throw new Error('Choose an absolute local file path.');
+  if (map.size >= 100) map.delete(map.keys().next().value!);
+  map.set(resolve(path).toLowerCase(), Date.now());
+}
+
+function requireBackupPath(map: Map<string, number>, value: unknown): string {
+  if (typeof value !== 'string' || !isAbsolute(value) || extname(value).toLowerCase() !== '.zip') throw new Error('Choose a ZIP backup archive using the file picker.');
+  const key = resolve(value).toLowerCase();
+  const selectedAt = map.get(key);
+  if (selectedAt === undefined || Date.now() - selectedAt > 10 * 60 * 1000) throw new Error('Choose the backup location again using the file picker.');
+  map.delete(key);
+  return resolve(value);
+}
+
+function recordDiagnostic(component: string, event: string, message: unknown): void {
+  try { journal?.record(component, event, message); }
+  catch {
+    loggingFailed = true;
+    console.error('Local diagnostic journal is not writable. Check the application data folder.');
+  }
+}
+
+const supervisor = new BackendSupervisor({
+  start: async (signal) => { await startBackend(signal); await checkBackendHealth(signal); },
+  stop: stopBackend,
+  stateChanged: (state, error) => {
+    recordDiagnostic('backend', state, error || `Backend ${state}`);
+    mainWindow?.webContents.send('backend:status', {
+      status: ['failed', 'degraded'].includes(state) ? 'error' : state === 'ready' ? 'ready' : 'starting',
+      state, error: error ? sanitizeDiagnostic(error, [backendToken || '', sessionToken || '']) : undefined,
+      recoverable: state !== 'stopping',
+    });
+  },
+});
+
+const ipcMain = {
+  handle(channel: string, listener: (event: Electron.IpcMainInvokeEvent, ...args: any[]) => any): void {
+    electronIpcMain.handle(channel, async (event, ...args) => {
+      assertTrustedSender(event, mainWindow, rendererUrl);
+      try { return await listener(event, ...args); }
+      catch (error) {
+        const message = sanitizeDiagnostic(error, [backendToken || '', sessionToken || '']);
+        recordDiagnostic('desktop', 'request-failed', `${channel}: ${message}`);
+        throw new Error(message);
+      }
+    });
+  },
+};
 
 async function getResponseError(response: Response): Promise<Error> {
   const fallback = `Local service request failed (${response.status})`;
@@ -30,8 +93,8 @@ async function getResponseError(response: Response): Promise<Error> {
   try {
     body = await response.text();
     const parsed = JSON.parse(body) as { detail?: unknown; message?: unknown };
-    if (typeof parsed.detail === 'string') return new Error(parsed.detail);
-    if (typeof parsed.message === 'string') return new Error(parsed.message);
+    if (typeof parsed.detail === 'string') return new Error(sanitizeDiagnostic(parsed.detail, [backendToken || '', sessionToken || '']));
+    if (typeof parsed.message === 'string') return new Error(sanitizeDiagnostic(parsed.message, [backendToken || '', sessionToken || '']));
     if (Array.isArray(parsed.detail)) {
       const messages = parsed.detail
         .map((item) => typeof item === 'object' && item && 'msg' in item ? String(item.msg) : '')
@@ -41,17 +104,40 @@ async function getResponseError(response: Response): Promise<Error> {
   } catch {
     // A non-JSON response is handled below without exposing an HTML error page.
   }
-  return new Error(body && !body.trimStart().startsWith('<') ? body : fallback);
+  return new Error(fallback);
 }
 
 /** Add the private Electron-to-backend credential to every loopback call. */
 async function fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  const requested = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  const local = /^http:\/\/127\.0\.0\.1:(?:\d{1,5}|null)(\/.*)$/.exec(requested);
+  if (!local) throw new Error('Invalid local service address.');
+  const route = local[1];
+  if (route !== '/health/ready') validateProxyRequest(init.method || 'GET', route);
+  if (typeof init.body === 'string' && Buffer.byteLength(init.body) > 1024 * 1024) throw new Error('The request is too large.');
   if (backendStartupPromise) await backendStartupPromise;
+  if (supervisor.state !== 'ready' || !backendPort || !backendToken) throw new Error(supervisor.lastError || 'The local service is not ready. Open Diagnostics to retry.');
   const headers = new Headers(init.headers);
   if (backendToken) headers.set('X-NOC-AI-Backend-Token', backendToken);
-  const response = await nativeFetch(input, { ...init, headers });
+  // A queued request must use the port selected by the completed restart.
+  const response = await nativeFetch(`http://127.0.0.1:${backendPort}${route}`, { ...init, headers, redirect: 'error', signal: init.signal || AbortSignal.timeout(180000) });
   if (!response.ok) throw await getResponseError(response);
   return response;
+}
+
+async function cancelActiveGenerations(): Promise<void> {
+  await Promise.allSettled([...activeGenerations].map(async ([id, controller]) => {
+    controller.abort();
+    if (backendPort && backendToken && sessionToken && supervisor.state === 'ready') {
+      try {
+        const response = await nativeFetch(`http://127.0.0.1:${backendPort}/api/v1/chat/stop/${encodeURIComponent(id)}`, {
+          method: 'POST', redirect: 'error', signal: AbortSignal.timeout(3000),
+          headers: { 'X-NOC-AI-Backend-Token': backendToken, 'Authorization': `Bearer ${sessionToken}` },
+        });
+        if (!response.ok) throw new Error('Generation cancellation was rejected.');
+      } catch { recordDiagnostic('chat', 'cancel-failed', 'Generation cancellation could not reach the local service.'); }
+    }
+  }));
 }
 
 async function createWindow(): Promise<BrowserWindow> {
@@ -80,14 +166,16 @@ async function createWindow(): Promise<BrowserWindow> {
     },
   });
   const window = mainWindow;
+  window.webContents.on('did-start-loading', () => { void cancelActiveGenerations(); });
 
-  window.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-    if (level >= 2) console.warn(`[renderer] ${message} (${sourceId}:${line})`);
+  window.webContents.on('console-message', (details) => {
+    if (details.level === 'warning' || details.level === 'error') recordDiagnostic('renderer', 'console-error', `Renderer ${details.level}, line ${details.lineNumber}`);
   });
 
   window.webContents.on('render-process-gone', (_event, details) => {
     if (isShuttingDown || window.isDestroyed() || details.reason === 'clean-exit') return;
-    console.error('Renderer process exited unexpectedly', details);
+    recordDiagnostic('renderer', 'render-process-gone', `reason=${details.reason}, exitCode=${details.exitCode}`);
+    void cancelActiveGenerations();
     const now = Date.now();
     if (now - lastRendererRecoveryAt > 15000) {
       lastRendererRecoveryAt = now;
@@ -111,6 +199,7 @@ async function createWindow(): Promise<BrowserWindow> {
   });
 
   window.on('unresponsive', () => {
+    recordDiagnostic('renderer', 'unresponsive', 'The interface is not responding.');
     if (isShuttingDown || window.isDestroyed() || unresponsiveDialogOpen) return;
     unresponsiveDialogOpen = true;
     void dialog.showMessageBox(window, {
@@ -127,29 +216,23 @@ async function createWindow(): Promise<BrowserWindow> {
     });
   });
 
-  // Block all navigation except explicit allow-list
-  const ALLOWED_URLS = [
-    'http://127.0.0.1:*',
-    'file://*',
-  ];
+  window.on('responsive', () => recordDiagnostic('renderer', 'responsive', 'The interface is responding again.'));
 
   mainWindow.webContents.on('will-navigate', (e, url) => {
-    const allowed = ALLOWED_URLS.some(pattern => {
-      const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
-      return regex.test(url);
-    });
-    if (!allowed) {
-      e.preventDefault();
-    }
+    if (!isTrustedRendererUrl(url, rendererUrl)) e.preventDefault();
   });
+  mainWindow.webContents.on('will-redirect', (e, url) => { if (!isTrustedRendererUrl(url, rendererUrl)) e.preventDefault(); });
+  mainWindow.webContents.on('will-attach-webview', e => e.preventDefault());
 
   // Block new-window creation
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://127.0.0.1:') || url.startsWith('https://')) {
-      shell.openExternal(url);
-    }
+    try { void shell.openExternal(validateExternalUrl(url)).catch(() => recordDiagnostic('desktop', 'link-failed', 'The external link could not be opened.')); }
+    catch { recordDiagnostic('desktop', 'link-blocked', 'An unsupported external link was blocked.'); }
     return { action: 'deny' };
   });
+
+  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  session.defaultSession.setPermissionCheckHandler(() => false);
 
   // Strict CSP
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -162,7 +245,7 @@ async function createWindow(): Promise<BrowserWindow> {
           "style-src 'self' 'unsafe-inline'; " +
           "img-src 'self' data: blob:; " +
           "font-src 'self' data:; " +
-          "connect-src 'self' http://127.0.0.1:*; " +
+          "connect-src 'self'; " +
           "frame-ancestors 'none'; " +
           "base-uri 'self'; " +
           "form-action 'none';"
@@ -171,16 +254,16 @@ async function createWindow(): Promise<BrowserWindow> {
     });
   });
 
-  if (isDev) {
+  window.once('ready-to-show', () => {
+    if (!window.isDestroyed()) window.show();
+  });
+
+  if (useDevServer) {
     await mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
   } else {
     await mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
   }
-
-  mainWindow.once('ready-to-show', () => {
-    mainWindow?.show();
-  });
 
   mainWindow.on('close', (event) => {
     if (!isShuttingDown) {
@@ -232,9 +315,12 @@ function findBackendCommand(): { command: string; prefixArgs: string[]; cwd: str
   };
 }
 
-async function startBackend(): Promise<number> {
+async function startBackend(signal: AbortSignal): Promise<number> {
+  if (signal.aborted) throw new Error('Backend operation cancelled.');
+  if (backendProcess) throw new Error('A backend process is already owned by this application.');
   backendToken = randomBytes(32).toString('hex');
   backendPort = await getRandomPort();
+  if (signal.aborted) throw new Error('Backend operation cancelled.');
   
   const backend = findBackendCommand();
   const dataDir = getDataDir();
@@ -256,48 +342,56 @@ async function startBackend(): Promise<number> {
       NOC_AI_KNOWLEDGE_DIR: join(dataDir, 'knowledge'),
       NOC_AI_LLAMA_SERVER_PATH: backend.llamaPath,
       NOC_AI_BUNDLED_MODELS_DIR: backend.bundledModelsPath,
+      NOC_AI_PARENT_PID: String(process.pid),
+      NOC_AI_PARENT_PIPE: '1',
     },
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   };
 
-  console.log(`Starting backend executable: ${backend.command}`);
+  recordDiagnostic('backend', 'spawn', 'Starting the bundled local service.');
 
   const processHandle = spawn(backend.command, args, options);
   backendProcess = processHandle;
 
   processHandle.stdout?.on('data', (data) => {
-    console.log(`[backend] ${data.toString().trim()}`);
+    recordDiagnostic('backend', 'stdout', data.toString().trim());
   });
   processHandle.stderr?.on('data', (data) => {
-    console.warn(`[backend:stderr] ${data.toString().trim()}`);
+    recordDiagnostic('backend', 'stderr', data.toString().trim());
   });
 
   processHandle.on('exit', (code, signal) => {
-    console.log(`Backend exited: code=${code}, signal=${signal}`);
+    recordDiagnostic('backend', 'exit', `code=${code}, signal=${signal}`);
+    if (backendProcess !== processHandle) return;
     backendProcess = null;
-    if (!isShuttingDown && mainWindow) {
-      mainWindow.webContents.send('backend:crashed', { code, signal });
+    if (!isShuttingDown && !['stopping', 'starting', 'backing_off'].includes(supervisor.state)) {
+      mainWindow?.webContents.send('backend:crashed', { code, signal });
+      const recovery = supervisor.crashed(`The local service stopped unexpectedly (exit ${code ?? signal}).`);
+      backendStartupPromise = recovery;
+      void recovery.catch(error => recordDiagnostic('backend', 'recovery-failed', error));
     }
   });
 
   processHandle.on('error', (err) => {
-    console.error('Backend process error', err);
+    recordDiagnostic('backend', 'spawn-error', err);
+    if (backendProcess === processHandle && !processHandle.pid) backendProcess = null;
     if (mainWindow) {
-      mainWindow.webContents.send('backend:error', { message: err.message });
+      mainWindow.webContents.send('backend:error', { message: sanitizeDiagnostic(err, [backendToken || '']) });
     }
   });
 
   // Wait for port to be listening
   // First launch may need to copy and initialize the bundled embedding model.
-  await waitForPort(backendPort!, 60000);
+  await waitForPort(backendPort!, 60000, signal);
   
   return backendPort!;
 }
 
-async function waitForPort(port: number, timeout: number): Promise<void> {
+async function waitForPort(port: number, timeout: number, signal: AbortSignal): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
+    if (signal.aborted) throw new Error('Backend operation cancelled.');
     if (!backendProcess) {
       throw new Error('Backend exited before opening its local port');
     }
@@ -306,8 +400,9 @@ async function waitForPort(port: number, timeout: number): Promise<void> {
       await new Promise<void>((resolve, reject) => {
         const net = require('net');
         const socket = net.createConnection(port, '127.0.0.1');
+        socket.setTimeout(500, () => { socket.destroy(); reject(new Error('Local connection timed out.')); });
         socket.on('connect', () => { socket.destroy(); resolve(); });
-        socket.on('error', reject);
+        socket.on('error', (error: Error) => { socket.destroy(); reject(error); });
       });
       return;
     } catch {
@@ -318,21 +413,23 @@ async function waitForPort(port: number, timeout: number): Promise<void> {
 }
 
 function getDataDir(): string {
-  const base = process.env.APPDATA || process.env.HOME || '.';
-  return join(base, 'NOC AI Assistant');
+  return isolatedProfile ? validateProfileOverride(isolatedProfile) : app.getPath('userData');
 }
 
-async function checkBackendHealth(): Promise<void> {
-  const maxRetries = 30;
+async function checkBackendHealth(signal: AbortSignal): Promise<void> {
+  const maxRetries = 45; // Increased retries to 45 (45 seconds total)
   for (let i = 0; i < maxRetries; i++) {
+    if (signal.aborted) throw new Error('Backend operation cancelled.');
+    if (!backendProcess) throw new Error('The backend stopped before it became ready.');
     try {
       const response = await nativeFetch(`http://127.0.0.1:${backendPort}/health/ready`, {
         headers: { 'X-NOC-AI-Backend-Token': backendToken || '' },
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+        redirect: 'error',
       });
       if (response.ok) {
-        const health = await response.json() as { status?: string };
-        if (health.status === 'ready') {
+        const health = await response.json() as { status?: string; ready?: boolean };
+        if (health.ready === true || (health.ready !== false && health.status === 'ready')) {
           return;
         }
       }
@@ -345,76 +442,104 @@ async function checkBackendHealth(): Promise<void> {
 }
 
 async function startBackendUntilReady(): Promise<void> {
-  await startBackend();
-  await checkBackendHealth();
+  await supervisor.start();
 }
 
 async function restartBackendService(): Promise<void> {
-  const restartPromise = (async () => {
-    await stopBackend();
-    await startBackendUntilReady();
-  })();
+  const restartPromise = supervisor.restart();
   backendStartupPromise = restartPromise;
   await restartPromise;
 }
 
-async function shutdown(): Promise<void> {
+async function shutdown(exitCode = 0): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
   
-  console.log('Shutting down...');
+  recordDiagnostic('desktop', 'shutdown', 'Closing the application and its owned processes.');
   
   if (mainWindow) {
     mainWindow.webContents.send('app:shutting-down');
   }
   
-  await stopBackend();
+  try { await supervisor.stop(true); }
+  catch (error) {
+    recordDiagnostic('desktop', 'shutdown-failed', error);
+    // Closing the ownership pipe also triggers the backend parent-death cleanup.
+    backendProcess?.stdin?.destroy();
+    app.exit(1);
+    return;
+  }
   
   if (mainWindow) {
     mainWindow.destroy();
     mainWindow = null;
   }
   
-  app.exit(0);
+  recordDiagnostic('desktop', 'clean-shutdown', 'All application-owned processes stopped.');
+  app.exit(exitCode);
 }
 
 async function stopBackend(): Promise<void> {
-  if (!backendProcess) return;
-  const backendPid = backendProcess.pid;
+  const owned = backendProcess;
+  if (!owned) return;
+  const backendPid = owned.pid;
+
+  // Attempt graceful shutdown first
   try {
-    await fetch(`http://127.0.0.1:${backendPort}/internal/prepare-shutdown`, {
+    const response = await nativeFetch(`http://127.0.0.1:${backendPort}/internal/prepare-shutdown`, {
       method: 'POST',
-      signal: AbortSignal.timeout(15000),
+      headers: { 'X-NOC-AI-Backend-Token': backendToken || '' },
+      signal: AbortSignal.timeout(3000),
+      redirect: 'error',
     });
+    if (!response.ok) throw new Error(`Cleanup returned HTTP ${response.status}.`);
   } catch (error) {
-    console.warn('Backend pre-shutdown cleanup failed', error);
+    recordDiagnostic('backend', 'cleanup-failed', error);
   }
+  // EOF asks the backend ownership watcher to shut down even if HTTP cleanup failed.
+  owned.stdin?.end();
+  if (await waitForExit(owned, 4000)) return;
+
+  // Force kill if still running
   if (process.platform === 'win32' && backendPid) {
-    await new Promise<void>((resolve) => {
-      const killer = spawn('taskkill.exe', ['/PID', String(backendPid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const killer = spawn('taskkill.exe', ['/PID', String(backendPid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        const timer = setTimeout(() => { killer.kill(); reject(new Error('Owned process termination timed out.')); }, 5000);
+        killer.once('error', error => { clearTimeout(timer); reject(error); });
+        killer.once('exit', () => { clearTimeout(timer); resolve(); });
       });
-      killer.once('error', () => resolve());
-      killer.once('exit', () => resolve());
-    });
+    } catch (killError) {
+      recordDiagnostic('backend', 'terminate-failed', killError);
+    }
   } else {
-    backendProcess?.kill('SIGTERM');
+    try {
+      owned.kill('SIGTERM');
+    } catch (killError) {
+      recordDiagnostic('backend', 'terminate-failed', killError);
+    }
   }
-  await waitForExit(5000);
+
+  // Wait for process to exit with a reasonable timeout
+  if (!await waitForExit(owned, 3000)) {
+    owned.kill('SIGKILL');
+    if (!await waitForExit(owned, 2000)) throw new Error('The previous backend process did not stop. Restart is blocked to prevent duplicate services.');
+  }
+  if (backendProcess === owned) backendProcess = null;
 }
 
-async function waitForExit(timeout: number): Promise<void> {
+async function waitForExit(owned: ReturnType<typeof spawn>, timeout: number): Promise<boolean> {
   return new Promise((resolve) => {
-    if (!backendProcess) return resolve();
+    if (owned.exitCode !== null || owned.signalCode !== null) return resolve(true);
+    const exited = () => { clearTimeout(timer); resolve(true); };
     const timer = setTimeout(() => {
-      backendProcess?.kill('SIGKILL');
-      resolve();
+      owned.off('exit', exited);
+      resolve(false);
     }, timeout);
-    backendProcess.once('exit', () => {
-      clearTimeout(timer);
-      resolve();
-    });
+    owned.once('exit', exited);
   });
 }
 
@@ -431,13 +556,14 @@ function setupIpcHandlers(): void {
   
   // Forward backend API calls
   ipcMain.handle('backend:request', async (event, { method, path, body }) => {
-    const response = await fetch(`http://127.0.0.1:${backendPort}${path}`, {
-      method,
+    const request = validateProxyRequest(method, path, body);
+    const response = await fetch(`http://127.0.0.1:${backendPort}${request.path}`, {
+      method: request.method,
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${sessionToken}`,
       },
-      body: body ? JSON.stringify(body) : undefined,
+      body: request.body,
     });
     
     if (!response.ok) {
@@ -463,6 +589,7 @@ function setupIpcHandlers(): void {
       filters: options?.filters || [],
       title: options?.title || 'Select Files',
     });
+    if (!result.canceled) for (const path of result.filePaths) rememberNativePath(approvedReadPaths, path);
     return result.filePaths;
   });
   
@@ -472,15 +599,17 @@ function setupIpcHandlers(): void {
       title: options?.title || 'Save File',
       defaultPath: options?.defaultPath,
     });
+    if (!result.canceled && result.filePath) rememberNativePath(approvedWritePaths, result.filePath);
     return result.filePath;
   });
   
   ipcMain.handle('shell:openExternal', async (event, url) => {
-    await shell.openExternal(url);
+    await shell.openExternal(validateExternalUrl(url));
   });
   
   ipcMain.handle('shell:openPath', async (event, path) => {
-    await shell.openPath(path);
+    const error = await shell.openPath(validateDirectoryToOpen(path, getDataDir()));
+    if (error) throw new Error('The application folder could not be opened.');
   });
   
   // Backend API proxy - expose all nocaiAPI methods
@@ -591,13 +720,20 @@ function setupIpcHandlers(): void {
   });
 
   ipcMain.handle('nocai:chat:sendMessage', async (event, request: ChatSendPayload) => {
-    const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
-      body: JSON.stringify({ ...request, stream: false }),
-    });
-    if (!response.ok) throw new Error(await response.text());
-    return response.json();
+    if (!request || typeof request.conversationId !== 'string' || !/^[\w-]+$/.test(request.conversationId)) throw new Error('Choose a valid conversation.');
+    if (activeGenerations.size >= 4 || activeGenerations.has(request.conversationId)) throw new Error('A response is already being generated. Wait for it or select Stop.');
+    const controller = new AbortController();
+    activeGenerations.set(request.conversationId, controller);
+    try {
+      const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/completions`, {
+        method: 'POST', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(180000)]),
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
+        body: JSON.stringify({ ...request, stream: false }),
+      });
+      return await response.json();
+    } finally {
+      if (activeGenerations.get(request.conversationId) === controller) activeGenerations.delete(request.conversationId);
+    }
   });
 
   ipcMain.handle('nocai:chat:stopGeneration', async (event, generationId) => {
@@ -900,16 +1036,18 @@ function setupIpcHandlers(): void {
   });
   
   ipcMain.handle('nocai:system:createBackup', async (event, options) => {
+    const destination = requireBackupPath(approvedWritePaths, options?.destination);
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/system/backup`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
-      body: JSON.stringify(options),
+      body: JSON.stringify({ destination, includeModels: options?.includeModels === true, includeKnowledge: options?.includeKnowledge !== false }),
     });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
   });
   
   ipcMain.handle('nocai:system:restoreBackup', async (event, path) => {
+    path = requireBackupPath(approvedReadPaths, path);
     const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/system/restore`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
@@ -923,21 +1061,46 @@ function setupIpcHandlers(): void {
     await restartBackendService();
     return { success: true };
   });
+
+  ipcMain.handle(IPC.SYSTEM_DIAGNOSTICS, async () => getDiagnostics());
+  ipcMain.handle(IPC.SYSTEM_EXPORT_DIAGNOSTICS, async () => {
+    const selected = await dialog.showSaveDialog(mainWindow!, {
+      title: 'Export local diagnostics', defaultPath: `NOC-AI-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: 'Diagnostic report', extensions: ['json'] }],
+    });
+    if (selected.canceled || !selected.filePath) return { path: null };
+    if (!journal) throw new Error('The diagnostic journal is unavailable.');
+    journal.exportTo(selected.filePath, getDiagnostics());
+    return { path: selected.filePath };
+  });
   
   // Events (Main -> Renderer)
   // These are not handlers but events that main sends to renderer
 }
 
+function getDiagnostics() {
+  return {
+    version: app.getVersion(),
+    backend: { state: supervisor.state, lastError: loggingFailed ? 'Diagnostic logging is not writable. Check the application data folder.' : supervisor.lastError ? sanitizeDiagnostic(supervisor.lastError, [backendToken || '', sessionToken || '']) : null, restartAttempts: supervisor.restartAttempts },
+    paths: { logs: journal?.directory || join(getDataDir(), 'logs'), appData: getDataDir() },
+    recentErrors: journal?.snapshot() || [],
+  };
+}
+
 // App lifecycle
 app.on('ready', async () => {
-  setupIpcHandlers();
-  
-  // Single instance lock
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
     app.quit();
     return;
   }
+  try {
+    journal = new DiagnosticJournal(join(getDataDir(), 'logs'), app.getVersion(), () => [backendToken || '', sessionToken || '']);
+    const previous = journal.snapshot().at(-1);
+    if (previous && previous.event !== 'clean-shutdown') recordDiagnostic('desktop', 'previous-unclean-exit', 'The previous application run did not record a clean shutdown.');
+    recordDiagnostic('desktop', 'startup', 'Application starting.');
+  } catch { loggingFailed = true; }
+  setupIpcHandlers();
   
   app.on('second-instance', () => {
     if (mainWindow) {
@@ -948,7 +1111,15 @@ app.on('ready', async () => {
   
   const startupPromise = startBackendUntilReady();
   backendStartupPromise = startupPromise;
-  await createWindow();
+  // Observe immediately: a spawn failure can occur while Chromium is still loading.
+  void startupPromise.catch(error => recordDiagnostic('backend', 'startup-failed', error));
+  try { await createWindow(); }
+  catch (error) {
+    recordDiagnostic('renderer', 'window-load-failed', error);
+    dialog.showErrorBox('NOC AI Assistant could not open', 'The application interface could not be loaded. Reinstall the current application build. Your local data is preserved.');
+    await shutdown(1);
+    return;
+  }
   
   // Start backend
   try {
@@ -960,13 +1131,24 @@ app.on('ready', async () => {
       backendPort,
     });
   } catch (error) {
-    console.error('Backend startup failed', error);
+    recordDiagnostic('backend', 'startup-failed', error);
     mainWindow?.webContents.send('backend:status', { 
       status: 'error', 
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeDiagnostic(error, [backendToken || '', sessionToken || '']),
       recoverable: true
     });
   }
+});
+
+process.on('uncaughtException', error => {
+  recordDiagnostic('desktop', 'uncaughtException', error);
+  void shutdown(1);
+});
+process.on('unhandledRejection', error => {
+  recordDiagnostic('desktop', 'unhandledRejection', error);
+});
+app.on('child-process-gone', (_event, details) => {
+  recordDiagnostic('desktop', 'child-process-gone', `type=${details.type}, reason=${details.reason}, exitCode=${details.exitCode}`);
 });
 
 app.on('before-quit', async (event) => {

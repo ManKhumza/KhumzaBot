@@ -1,14 +1,16 @@
 import React from 'react';
 import { AlertCircle, RefreshCw, X } from 'lucide-react';
 import { clsx } from 'clsx';
+import { Link } from 'react-router-dom';
 
 interface BackendStatusBannerProps {
   isReady: boolean;
   error: string | null;
   onRetry?: () => void;
+  retrying?: boolean;
 }
 
-export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBannerProps) => {
+export const BackendStatusBanner = ({ isReady, error, onRetry, retrying }: BackendStatusBannerProps) => {
   const [dismissed, setDismissed] = React.useState(false);
 
   React.useEffect(() => setDismissed(false), [isReady, error]);
@@ -18,7 +20,7 @@ export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBa
   return (
     <div
       className={clsx(
-        'fixed top-0 left-0 right-0 z-50 px-4 py-2 border-b transition-all duration-300',
+        'relative z-40 flex-none px-4 py-2 border-b transition-all duration-300',
         error
           ? 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800'
           : 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-800'
@@ -36,7 +38,7 @@ export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBa
             'text-sm font-medium',
             error ? 'text-red-700 dark:text-red-300' : 'text-yellow-700 dark:text-yellow-300'
           )}>
-            {error ? 'Backend Error' : 'Backend Starting...'}
+            {error ? isReady ? 'Local services need attention' : 'Local services unavailable' : 'Starting local services...'}
           </span>
           {error && (
             <span className={clsx(
@@ -48,9 +50,11 @@ export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBa
           )}
         </div>
         <div className="flex items-center gap-2">
+          <Link className="text-sm underline" to="/diagnostics">Diagnostics</Link>
           {onRetry && (
             <button
               onClick={onRetry}
+              disabled={retrying}
               className={clsx(
                 'inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg transition-colors',
                 error
@@ -59,7 +63,7 @@ export const BackendStatusBanner = ({ isReady, error, onRetry }: BackendStatusBa
               )}
             >
               <RefreshCw className="w-4 h-4" />
-              Retry
+              {retrying ? 'Restarting...' : 'Retry'}
             </button>
           )}
           <button

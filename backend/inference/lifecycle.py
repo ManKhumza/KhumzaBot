@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import secrets
 import shutil
 import time
@@ -207,6 +208,7 @@ class LlamaServerProcess:
         self._stderr_ring: deque[str] = deque(maxlen=_LOG_RING_SIZE)
         self._drain_tasks: list[asyncio.Task] = []
         self._started_at: float | None = None
+        self._ownership = None
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -237,8 +239,9 @@ class LlamaServerProcess:
             "--ctx-size", str(self.ctx_size),
             "--n-gpu-layers", str(self.gpu_layers),
             "--threads", str(self.threads),
-            "--api-key", self.api_key,
             "--no-webui",
+            "--cors-origins", "http://nocai.invalid",
+            "--no-cors-credentials",
             "--log-disable",
         ]
 
@@ -254,11 +257,20 @@ class LlamaServerProcess:
             self.model_path.name,
         )
 
-        self.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        from backend.system.process_ownership import ProcessOwnership
+        self._ownership = ProcessOwnership()
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                env={**os.environ, "LLAMA_API_KEY": self.api_key},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=self._ownership.creationflags,
+            )
+            self._ownership.assign_and_resume(self.process.pid)
+        except BaseException:
+            await self._force_kill()
+            raise
 
         # Background tasks to continuously drain stdout/stderr so the
         # OS pipe buffers never fill up and block the child process.
@@ -275,7 +287,7 @@ class LlamaServerProcess:
 
         try:
             await self._wait_for_ready()
-        except Exception:
+        except BaseException:
             # Startup failed — clean up the process we just spawned
             await self._force_kill()
             raise
@@ -289,13 +301,9 @@ class LlamaServerProcess:
 
     async def stop(self, timeout: float = 10.0) -> None:
         """Gracefully stop the server. SIGTERM first, SIGKILL after timeout."""
-        # Cancel drain tasks first
-        for task in self._drain_tasks:
-            task.cancel()
-        self._drain_tasks.clear()
-
         if self.process is None or self.process.returncode is not None:
             self.process = None
+            await self._stop_drains()
             return
 
         logger.info("Stopping llama-server on port %s", self.port)
@@ -319,6 +327,7 @@ class LlamaServerProcess:
             await self.process.wait()
 
         self.process = None
+        await self._stop_drains()
 
     # ── health ─────────────────────────────────────────────────
 
@@ -412,14 +421,21 @@ class LlamaServerProcess:
 
     async def _force_kill(self) -> None:
         """Kill the process and cancel drain tasks. Used on startup failure."""
-        for task in self._drain_tasks:
-            task.cancel()
-        self._drain_tasks.clear()
-
         if self.process is not None and self.process.returncode is None:
             self.process.kill()
             await self.process.wait()
         self.process = None
+        await self._stop_drains()
+
+    async def _stop_drains(self) -> None:
+        tasks, self._drain_tasks = self._drain_tasks, []
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._ownership:
+            self._ownership.close()
+            self._ownership = None
 
     @staticmethod
     async def _drain_stream(
@@ -468,6 +484,11 @@ class ModelLifecycleManager:
         self._status_callbacks: list[Any] = []
         self._generation_count = 0
         self._generation_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._session_factory: Any = None
+        self._monitor_task: asyncio.Task | None = None
+        self._stopping = False
+        self.last_errors: dict[str, str] = {}
 
     # ── public API (called by main.py lifespan) ────────────────
 
@@ -481,6 +502,8 @@ class ModelLifecycleManager:
         from backend.db.models import Model
 
         SessionLocal = session_factory
+        self._session_factory = session_factory
+        self._stopping = False
         with SessionLocal() as db:
             active_ids = [
                 model.id
@@ -500,9 +523,16 @@ class ModelLifecycleManager:
                     model.status = "error"
                     model.validation_error = str(exc)[:2000]
                 db.commit()
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor(), name="model-runtime-monitor")
 
     async def shutdown(self) -> None:
         """Stop every managed llama-server. Called during app shutdown."""
+        self._stopping = True
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+            self._monitor_task = None
         if not self._servers:
             logger.info("No inference servers to stop")
             return
@@ -523,6 +553,14 @@ class ModelLifecycleManager:
     async def load_model(
         self, model: Any, role: str, config: dict[str, Any] | None = None
     ) -> ModelProvider:
+        async with self._lifecycle_lock:
+            if self._stopping:
+                raise LlamaServerError("Model runtime is shutting down")
+            return await self._load_model_locked(model, role, config)
+
+    async def _load_model_locked(
+        self, model: Any, role: str, config: dict[str, Any] | None = None
+    ) -> ModelProvider:
         """Load a model through an authenticated llama-server HTTP process."""
         if not hasattr(model, "id"):
             raise TypeError("load_model requires a Model instance")
@@ -533,7 +571,7 @@ class ModelLifecycleManager:
         if current is not None and current.model_id == model.id and current.process.is_running:
             return current
 
-        await self.unload_model(role)
+        await self._unload_model_locked(role)
         model_path = Path(model.filepath)
         if not model_path.is_file():
             raise FileNotFoundError(f"Model file missing on disk: {model_path}")
@@ -564,7 +602,7 @@ class ModelLifecycleManager:
                 "context_length", getattr(model, "context_length", None) or 4096
             ),
             gpu_layers=runtime_config.get(
-                "gpu_layers", getattr(self.settings, "default_gpu_layers", -1)
+                "gpu_layers", 0 if os.name == "nt" else getattr(self.settings, "default_gpu_layers", -1)
             ),
             threads=runtime_config.get(
                 "threads", getattr(self.settings, "default_threads", 0)
@@ -581,7 +619,8 @@ class ModelLifecycleManager:
                 timeout=httpx.Timeout(300.0, connect=10.0),
                 headers={"Authorization": f"Bearer {provider.api_key}"},
             )
-        except Exception:
+        except BaseException:
+            await server.stop()
             self._port_pool.release(port)
             provider.status = ModelStatus.FAILED
             self._notify_status(model.id, ModelStatus.FAILED, role)
@@ -596,9 +635,15 @@ class ModelLifecycleManager:
             self.embedding_provider = provider
             self.active_embedding_model_id = model.id
         self._notify_status(model.id, ModelStatus.READY, role)
+        self.last_errors.pop(role, None)
+        self._persist_model_state(model.id, "active", role=role)
         return provider
 
     async def unload_model(self, model_id: str) -> None:
+        async with self._lifecycle_lock:
+            await self._unload_model_locked(model_id)
+
+    async def _unload_model_locked(self, model_id: str) -> None:
         """Stop a model server, accepting either its id or its role."""
         provider: ModelProvider | None = None
         if model_id == "chat":
@@ -626,6 +671,49 @@ class ModelLifecycleManager:
         if self.active_embedding_model_id == model_id:
             self.embedding_provider = None
             self.active_embedding_model_id = None
+        if not self._stopping:
+            self._persist_model_state(model_id, "imported")
+
+    def _persist_model_state(self, model_id: str, status: str, error: str | None = None, role: str | None = None) -> None:
+        if self._session_factory is None:
+            return
+        from backend.db.models import Model
+        with self._session_factory() as db:
+            if status == "active" and role:
+                db.query(Model).filter(Model.role == role, Model.status == "active", Model.id != model_id).update({"status": "imported"})
+            model = db.get(Model, model_id)
+            if model:
+                model.status = status
+                model.validation_error = error
+                db.commit()
+
+    async def reconcile_runtime_state(self) -> None:
+        """Clear active state as soon as an owned process exits or loses health."""
+        async with self._lifecycle_lock:
+            for role, provider in (("chat", self.chat_provider), ("embedding", self.embedding_provider)):
+                if provider is None:
+                    continue
+                server = provider.process
+                if server and server.is_running and await server.is_healthy():
+                    continue
+                diagnostics = server.diagnostics() if server else {}
+                message = f"{role.capitalize()} runtime stopped or became unhealthy (exit code {diagnostics.get('exit_code')}); reload the model"
+                model_id = provider.model_id
+                await self._unload_model_locked(model_id)
+                self.last_errors[role] = message
+                self._persist_model_state(model_id, "error", message)
+                self._notify_status(model_id, ModelStatus.FAILED, role)
+                logger.error("%s", message)
+
+    async def _monitor(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(2.0)
+            try:
+                await self.reconcile_runtime_state()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("Runtime reconciliation failed; retrying on the next probe", exc_info=False)
 
     def get_server(self, model_id: str) -> LlamaServerProcess | None:
         """Return the server process for a model, or None."""

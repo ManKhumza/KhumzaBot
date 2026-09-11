@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from typing import Optional, List
+from typing import Optional, List, Literal
 import uuid
 import shutil
 from pathlib import Path
@@ -40,7 +40,7 @@ class ModelResponse(BaseModel):
 class ImportModelRequest(BaseModel):
     model_config = {"populate_by_name": True}
     sourcePath: str
-    role: str
+    role: Literal["chat", "embedding"]
     name: Optional[str] = None
     copy_file: bool = Field(True, alias="copy")
 
@@ -48,13 +48,13 @@ class PathRequest(BaseModel):
     path: str
 
 class ActivateModelRequest(BaseModel):
-    role: str
+    role: Literal["chat", "embedding"]
 
 class ModelConfigUpdate(BaseModel):
-    gpuLayers: Optional[int] = None
-    threads: Optional[int] = None
-    batchSize: Optional[int] = None
-    contextLength: Optional[int] = None
+    gpuLayers: Optional[int] = Field(None, ge=-1, le=256)
+    threads: Optional[int] = Field(None, ge=0, le=256)
+    batchSize: Optional[int] = Field(None, ge=1, le=4096)
+    contextLength: Optional[int] = Field(None, ge=128, le=131072)
     ropeFreqBase: Optional[int] = None
     ropeFreqScale: Optional[int] = None
     extraArgs: Optional[List[str]] = None
@@ -103,7 +103,7 @@ async def import_model(
     settings = get_settings()
     source = Path(request.sourcePath).resolve()
     
-    if not source.exists():
+    if not source.is_file():
         raise HTTPException(404, "Source file not found")
     
     if source.suffix.lower() != ".gguf":
@@ -121,7 +121,9 @@ async def import_model(
     if request.copy_file:
         shutil.copy2(source, dest)
     else:
-        shutil.move(str(source), str(dest))
+        # Register externally managed GGUFs in place. A reference import must
+        # never move the user's only model into a disposable profile.
+        dest = source
     
     model = Model(
         id=str(uuid.uuid4()),
@@ -132,6 +134,7 @@ async def import_model(
         size_bytes=dest.stat().st_size,
         role=request.role,
         status="imported",
+        model_metadata={"managed_copy": request.copy_file},
         imported_by=current_user.id,
     )
     db.add(model)
@@ -201,11 +204,21 @@ async def delete_model(
     if not model:
         raise HTTPException(404, "Model not found")
     
-    try:
-        Path(model.filepath).unlink(missing_ok=True)
-    except:
-        pass
-    
+    if model.status == "active":
+        raise HTTPException(409, "Deactivate this model before removing it")
+    from backend.db.models import Collection, Conversation, Message
+    if (db.query(Collection.id).filter(Collection.embedding_model_id == model.id).first()
+            or db.query(Conversation.id).filter(Conversation.model_id == model.id).first()
+            or db.query(Message.id).filter(Message.model_id == model.id).first()):
+        raise HTTPException(409, "This model is referenced by knowledge or conversations and cannot be removed")
+    path = Path(model.filepath).resolve()
+    managed_root = Path(get_settings().models_dir).resolve()
+    managed_copy = (model.model_metadata or {}).get("managed_copy", path.is_relative_to(managed_root))
+    if managed_copy and path.is_relative_to(managed_root):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise HTTPException(409, "The model file could not be removed; close the model runtime and retry") from exc
     db.delete(model)
     db.commit()
     return {"success": True}

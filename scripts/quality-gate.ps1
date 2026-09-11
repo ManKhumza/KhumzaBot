@@ -4,6 +4,7 @@
 [CmdletBinding()]
 param(
     [switch]$Package,
+    [ValidateRange(0, 180)][int]$SoakMinutes = 0,
     [string]$ReportPath
 )
 
@@ -36,13 +37,17 @@ function Invoke-GateStep {
         [string]$Name,
         [string]$Executable,
         [string[]]$Arguments,
-        [string]$WorkingDirectory = $ProjectRoot
+        [string]$WorkingDirectory = $ProjectRoot,
+        [Nullable[int]]$WorkflowSoakMinutes = $null
     )
     $SafeName = $Name -replace '[^a-zA-Z0-9_-]', '-'
     $LogPath = Join-Path $LogDirectory "$SafeName.log"
     $StderrPath = Join-Path $LogDirectory "$SafeName.stderr.log"
     $Timer = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host "`n==> $Name" -ForegroundColor Cyan
+    if ($null -ne $WorkflowSoakMinutes) {
+        Write-Host "Workflow soak duration: $WorkflowSoakMinutes minute(s); 0 runs the short CI cycles."
+    }
     $ExitCode = 1
     $Failure = $null
     Push-Location $WorkingDirectory
@@ -74,8 +79,26 @@ function Invoke-GateStep {
     $Passed = ($ExitCode -eq 0 -and -not $Failure)
     $Detail = if ($Passed) { "exit 0" } elseif ($Failure) { $Failure } else { "exit $ExitCode" }
     Add-GateResult -Name $Name -Passed $Passed -Seconds $Timer.Elapsed.TotalSeconds -Log $LogPath -Detail $Detail
+    if ($null -ne $WorkflowSoakMinutes) {
+        $script:Results[$script:Results.Count - 1]["soak_minutes"] = $WorkflowSoakMinutes
+    }
     if ($Passed) { Write-Host "PASS: $Name" -ForegroundColor Green }
     else { Write-Host "FAIL: $Name ($Detail)" -ForegroundColor Red }
+}
+
+function Invoke-DesktopWorkflowGate {
+    param([string]$Name, [switch]$Packaged)
+    # A release runs the extended soak on its rebuilt executable once. Keep
+    # development verification short in that case, regardless of inherited env.
+    $Minutes = if ($Package -and -not $Packaged) { 0 } else { $SoakMinutes }
+    $PreviousSoakMinutes = $env:NOC_AI_E2E_SOAK_MINUTES
+    try {
+        $env:NOC_AI_E2E_SOAK_MINUTES = $Minutes.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        Invoke-GateStep -Name $Name -Executable "npm.cmd" -Arguments @("run", "test:e2e") `
+            -WorkingDirectory (Join-Path $ProjectRoot "apps\desktop\electron") -WorkflowSoakMinutes $Minutes
+    } finally {
+        $env:NOC_AI_E2E_SOAK_MINUTES = $PreviousSoakMinutes
+    }
 }
 
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
@@ -117,7 +140,7 @@ $SecurityPaths = @(
     "backend\security\__init__.py",
     "backend\security\dpapi.py",
     "backend\security\encryption.py",
-    "apps\desktop\electron-builder.yml",
+    "apps\desktop\electron\builder.yaml",
     ".github\workflows\build-windows.yml",
     "scripts\verify-packaging.ps1",
     "tests\test_security.py"
@@ -127,7 +150,7 @@ foreach ($RelativePath in $SecurityPaths) {
         $SecurityProblems.Add("Missing security deliverable: $RelativePath")
     }
 }
-$BuilderConfigPath = Join-Path $ProjectRoot "apps\desktop\electron-builder.yml"
+$BuilderConfigPath = Join-Path $ProjectRoot "apps\desktop\electron\builder.yaml"
 if (Test-Path -LiteralPath $BuilderConfigPath) {
     $BuilderConfig = Get-Content -LiteralPath $BuilderConfigPath -Raw
     if ($BuilderConfig -notmatch '(?m)^\s*perMachine:\s*false\s*$') {
@@ -166,6 +189,7 @@ if (Get-Command "npm.cmd" -ErrorAction SilentlyContinue) {
     Invoke-GateStep "Renderer typecheck" "npm.cmd" @("run", "typecheck") (Join-Path $ProjectRoot "apps\desktop\renderer")
     Invoke-GateStep "Renderer production build" "npm.cmd" @("run", "build") (Join-Path $ProjectRoot "apps\desktop\renderer")
     Invoke-GateStep "Electron TypeScript build" "npm.cmd" @("run", "build") (Join-Path $ProjectRoot "apps\desktop\electron")
+    Invoke-DesktopWorkflowGate "Real desktop end-to-end workflows"
 }
 if ($Package) {
     Invoke-GateStep "Clean package and release verification" $PowerShellExecutable @("-NoProfile", "-File", (Join-Path $PSScriptRoot "build-all.ps1"))
@@ -176,6 +200,11 @@ if ($Package) {
         "-InstallerPath",
         (Join-Path $ProjectRoot "apps\desktop\electron\release")
     )
+    $PreviousPackagedExe = $env:NOC_AI_PACKAGED_EXE
+    try {
+        $env:NOC_AI_PACKAGED_EXE = Join-Path $ProjectRoot 'apps\desktop\electron\release\win-unpacked\NOC AI Assistant.exe'
+        Invoke-DesktopWorkflowGate "Packaged desktop end-to-end workflows" -Packaged
+    } finally { $env:NOC_AI_PACKAGED_EXE = $PreviousPackagedExe }
 }
 
 $Passed = ($script:Results.Count -gt 0 -and @($script:Results | Where-Object { -not $_.passed }).Count -eq 0)
@@ -184,6 +213,7 @@ $Report = [ordered]@{
     generated_at_utc = [DateTime]::UtcNow.ToString("o")
     project_root = $ProjectRoot
     package_requested = [bool]$Package
+    soak_minutes_requested = $SoakMinutes
     passed = $Passed
     gates = $script:Results
 }

@@ -8,6 +8,9 @@ from datetime import datetime
 from backend.auth.dependencies import get_db, get_current_user, require_permission
 from backend.db.models import User, Role, AuditLog, IngestionJob
 from backend.auth.password import hash_password
+from backend.auth.policy import validate_password
+from backend.auth.dependencies import ROLE_PERMISSIONS
+from backend.audit.service import audit_log
 
 router = APIRouter(tags=["admin"])
 
@@ -30,6 +33,18 @@ class CreateUserRequest(BaseModel):
     displayName: Optional[str] = None
     email: Optional[str] = None
     roles: List[str] = ["operator"]
+
+
+def validate_roles(roles):
+    if not roles or any(role not in ROLE_PERMISSIONS for role in roles):
+        raise HTTPException(400, "Choose a supported role: administrator, knowledge_manager or operator")
+
+
+def protect_last_administrator(db, user, roles, active):
+    if user.is_active and "administrator" in (user.roles or []) and (not active or "administrator" not in roles):
+        others = db.query(User).filter(User.id != user.id, User.is_active.is_(True)).all()
+        if not any("administrator" in (other.roles or []) for other in others):
+            raise HTTPException(409, "At least one active administrator is required")
 
 class UpdateUserRequest(BaseModel):
     displayName: Optional[str] = None
@@ -92,6 +107,8 @@ async def create_user(
     current_user: User = Depends(require_permission("admin:users")),
     db: Session = Depends(get_db)
 ):
+    validate_roles(request.roles)
+    validate_password(request.password, db)
     existing = db.query(User).filter(User.username == request.username).first()
     if existing:
         raise HTTPException(400, "Username already exists")
@@ -110,6 +127,8 @@ async def create_user(
     db.add(user)
     db.commit()
     db.refresh(user)
+    audit_log("admin.user_created", {"roles": user.roles}, actor_id=current_user.id, actor_name=current_user.username,
+              resource_type="user", resource_id=user.id, db=db)
     return user_to_response(user)
 
 @router.patch("/users/{user_id}", response_model=UserResponse)
@@ -122,6 +141,11 @@ async def update_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
+
+    if request.roles is not None:
+        validate_roles(request.roles)
+    protect_last_administrator(db, user, request.roles if request.roles is not None else user.roles,
+                              request.isActive if request.isActive is not None else user.is_active)
     
     if request.displayName is not None:
         user.display_name = request.displayName
@@ -134,6 +158,8 @@ async def update_user(
     
     user.updated_at = datetime.utcnow()
     db.commit()
+    audit_log("admin.user_updated", {"roles": user.roles, "isActive": user.is_active}, actor_id=current_user.id,
+              actor_name=current_user.username, resource_type="user", resource_id=user.id, db=db)
     return user_to_response(user)
 
 @router.delete("/users/{user_id}")
@@ -148,9 +174,12 @@ async def delete_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
+    protect_last_administrator(db, user, [], False)
     
     db.delete(user)
     db.commit()
+    audit_log("admin.user_deleted", {}, actor_id=current_user.id, actor_name=current_user.username,
+              resource_type="user", resource_id=user_id, db=db)
     return {"success": True}
 
 @router.get("/roles", response_model=List[RoleResponse])
@@ -158,8 +187,9 @@ async def list_roles(
     current_user: User = Depends(require_permission("admin:roles")),
     db: Session = Depends(get_db)
 ):
-    roles = db.query(Role).all()
-    return [role_to_response(r) for r in roles]
+    return [RoleResponse(id=name, name=name, description=name.replace("_", " ").capitalize(),
+                         permissions=sorted(permissions), isSystem=True)
+            for name, permissions in ROLE_PERMISSIONS.items()]
 
 @router.get("/audit", response_model=List[AuditLogResponse])
 async def get_audit_log(

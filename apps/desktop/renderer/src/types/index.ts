@@ -148,6 +148,7 @@ export interface Message {
 }
 
 export interface Citation {
+  sourceNumber?: number;
   chunkId: string;
   documentId: string;
   documentName: string;
@@ -250,6 +251,15 @@ export interface Settings {
     enableReranking: boolean;
     rerankerModelId: string | null;
   };
+  behavior: {
+    systemInstructions: string;
+    responseMode: 'knowledge_only' | 'knowledge_preferred' | 'model_only';
+    knowledgeScope: 'selected_collection' | 'all_collections';
+    citationStyle: 'inline' | 'sources_list' | 'inline_and_sources';
+    noKnowledgeResponse: string;
+    maxSources: number;
+    minimumRelevanceScore: number;
+  };
   storage: {
     dataLocation: string;
     modelStorage: string;
@@ -263,7 +273,7 @@ export interface Settings {
     requireSpecialChars: boolean;
   };
   diagnostics: {
-    logLevel: 'debug' | 'info' | 'warn' | 'error';
+    logLevel: 'debug' | 'info' | 'warning' | 'error';
     enableTelemetry: boolean;
     autoCheckUpdates: boolean;
     debugMode: boolean;
@@ -319,6 +329,7 @@ export interface BackupResult {
 
 export interface RestoreResult {
   success: boolean;
+  restartRequired?: boolean;
   previousBackup?: string;
 }
 

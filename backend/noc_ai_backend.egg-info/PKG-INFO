@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: noc-ai-backend
-Version: 1.0.2
+Version: 1.1.0
 Summary: NOC AI Assistant Local Backend
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
@@ -9,6 +9,7 @@ Requires-Dist: uvicorn[standard]>=0.27
 Requires-Dist: pydantic>=2.5
 Requires-Dist: pydantic-settings>=2.1
 Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: sqlcipher3-wheels>=0.5.4; platform_system == "Windows"
 Requires-Dist: sqlite-vec>=0.1.6
 Requires-Dist: python-multipart>=0.0.6
 Requires-Dist: python-magic>=0.4.27; platform_system != "Windows"

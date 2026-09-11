@@ -1,4 +1,3 @@
-import { IPC } from '../shared/ipc-contract';
 import type {
   ChatLoadPayload,
   ChatSendPayload,
@@ -7,6 +6,11 @@ import type {
 } from '../shared/ipc-contract';
 
 const { contextBridge, ipcRenderer } = require('electron');
+
+// Sandboxed Electron preloads cannot resolve arbitrary local CommonJS modules.
+// Keep runtime channel values self-contained; the type-only contract import above
+// is erased by TypeScript and therefore remains safe in the packaged preload.
+const SYSTEM_SHUTDOWN_CHANNEL = 'nocai:system:shutdown';
 
 // Expose the full nocai API that the renderer expects
 contextBridge.exposeInMainWorld('nocai', {
@@ -91,11 +95,13 @@ contextBridge.exposeInMainWorld('nocai', {
   system: {
     getHealth: () => ipcRenderer.invoke('nocai:system:getHealth'),
     getVersion: () => ipcRenderer.invoke('nocai:system:getVersion'),
+    getDiagnostics: () => ipcRenderer.invoke('nocai:system:getDiagnostics'),
+    exportDiagnostics: () => ipcRenderer.invoke('nocai:system:exportDiagnostics'),
     getDataPaths: () => ipcRenderer.invoke('nocai:system:getDataPaths'),
     createBackup: (options: any) => ipcRenderer.invoke('nocai:system:createBackup', options),
     restoreBackup: (path: string) => ipcRenderer.invoke('nocai:system:restoreBackup', path),
     restartBackend: () => ipcRenderer.invoke('nocai:system:restartBackend'),
-    shutdown: () => ipcRenderer.invoke(IPC.SYSTEM_SHUTDOWN),
+    shutdown: () => ipcRenderer.invoke(SYSTEM_SHUTDOWN_CHANNEL),
   },
   
   // Events (Main -> Renderer)

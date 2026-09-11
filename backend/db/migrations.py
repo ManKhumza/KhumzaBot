@@ -10,6 +10,7 @@ MIGRATIONS = [
     (3, "Add collection permissions", "Add ACL for collections"),
     (4, "Add model configs", "Add model runtime configuration"),
     (5, "Add audit log", "Add security audit logging"),
+    (6, "Validate bundled vector index", "Load vector extension and safely rebuild incompatible dimensions"),
 ]
 
 async def run_migrations(engine):
@@ -36,14 +37,11 @@ async def run_migrations(engine):
             logger.info(f"Applying migration {version}: {name}")
             
             try:
-                if version == 2:
+                if version in (2, 6):
                     await apply_migration_v2(session)
-                elif version == 3:
-                    pass
-                elif version == 4:
-                    pass
-                elif version == 5:
-                    pass
+                else:
+                    # These tables are defined in the authoritative ORM schema.
+                    Base.metadata.create_all(bind=session.connection())
                 
                 session.execute(
                     text("INSERT INTO schema_version (version, description) VALUES (:v, :d)"),
@@ -59,19 +57,7 @@ async def run_migrations(engine):
 
 
 async def apply_migration_v2(session):
-    try:
-        session.execute(text("SELECT load_extension('sqlite_vec')"))
-    except:
-        logger.warning("sqlite_vec extension not available, skipping vector table creation")
-        return
-    
-    session.execute(text("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-            chunk_id TEXT PRIMARY KEY,
-            embedding FLOAT[768],
-            collection_id TEXT,
-            document_id TEXT
-        )
-    """))
-    
-    session.commit()
+    from backend.db.vector_schema import ensure_vector_schema, load_vector_extension
+    connection = session.connection().connection.driver_connection
+    load_vector_extension(connection)
+    ensure_vector_schema(connection, 384)

@@ -17,11 +17,22 @@ import {
   Send,
   Square,
   X,
+  Zap,
+  Settings as SettingsIcon,
+  Plus,
+  MessageSquare,
+  FileText,
+  FolderOpen,
+  AlertCircle,
+  CheckCircle,
+  Clock,
 } from 'lucide-react';
 import { clsx } from 'clsx';
-import type { Citation, Collection, Conversation, Message, Model } from '@/types';
+import type { Citation, Collection, Conversation, Message, Model, Settings } from '@/types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { chatDrafts } from '@/stores/chatDrafts';
+import { userFacingError } from '@/utils/errors';
 
 const suggestedPrompts = [
   'Summarize this incident timeline and identify the likely trigger.',
@@ -75,7 +86,8 @@ export const ChatView = () => {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [selectedCollection, setSelectedCollection] = useState('');
-  const [input, setInput] = useState('');
+  const [behavior, setBehavior] = useState<Settings['behavior'] | null>(null);
+  const [input, setInput] = useState(() => chatDrafts.get(conversationId || 'new'));
   const [streaming, setStreaming] = useState(false);
   const [currentGenerationId, setCurrentGenerationId] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -84,19 +96,57 @@ export const ChatView = () => {
   const [showCollectionSelect, setShowCollectionSelect] = useState(false);
   const [savingPreference, setSavingPreference] = useState<'model' | 'collection' | null>(null);
   const [loading, setLoading] = useState(true);
+  const [backendReady, setBackendReady] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const generationRef = useRef<string | null>(null);
+  const stopRequested = useRef(false);
+  const routeRef = useRef(conversationId);
+  const loadSequence = useRef(0);
+  const creation = useRef<Promise<Conversation> | null>(null);
+  const readinessFlight = useRef<Promise<Model[]> | null>(null);
+  routeRef.current = conversationId;
+
+  const updateInput = (value: string) => {
+    setInput(value);
+    if (conversationId) chatDrafts.set(conversationId, value);
+  };
+
+  const refreshReadiness = useCallback(async () => {
+    if (readinessFlight.current) return readinessFlight.current;
+    readinessFlight.current = (async () => {
+      try {
+        const [health, listedModels] = await Promise.all([nocaiAPI.system.getHealth(), nocaiAPI.models.listModels('chat')]);
+        const activeModels = listedModels.filter((model) => model.status === 'active');
+        setModels(activeModels);
+        setBackendReady(health.status === 'ready' || health.status === 'degraded');
+        return activeModels;
+      } catch {
+        setBackendReady(false);
+        return [];
+      }
+    })();
+    try { return await readinessFlight.current; }
+    finally { readinessFlight.current = null; }
+  }, []);
 
   const loadData = useCallback(async () => {
+    const sequence = ++loadSequence.current;
     setLoading(true);
     setLoadError(null);
+    setError(null);
 
     if (conversationId === 'new') {
       try {
-        const newConversation = await nocaiAPI.chat.createConversation();
+        if (!creation.current) creation.current = nocaiAPI.chat.createConversation();
+        const newConversation = await creation.current;
+        if (loadSequence.current !== sequence) return;
         navigate(`/chats/${newConversation.id}`, { replace: true });
       } catch (loadFailure) {
-        setLoadError(loadFailure instanceof Error ? loadFailure.message : 'Could not create a conversation.');
+        creation.current = null;
+        if (loadSequence.current !== sequence) return;
+        setLoadError(userFacingError(loadFailure, 'Could not create a conversation.'));
         setLoading(false);
       }
       return;
@@ -109,12 +159,14 @@ export const ChatView = () => {
     }
 
     try {
-      const [conversationData, messageData, modelData, collectionData] = await Promise.all([
+      const [conversationData, messageData, modelData, collectionData, settingsData] = await Promise.all([
         nocaiAPI.chat.getConversations().then((items) => items.find((item) => item.id === conversationId)),
         nocaiAPI.chat.getMessages(conversationId),
         nocaiAPI.models.listModels('chat'),
         nocaiAPI.knowledge.listCollections(),
+        nocaiAPI.settings.get(),
       ]);
+      if (loadSequence.current !== sequence) return;
 
       if (!conversationData) {
         setConversation(null);
@@ -126,23 +178,61 @@ export const ChatView = () => {
       const activeCollections = collectionData.filter((collection) => collection.status === 'active');
       const savedModelIsActive = activeModels.some((model) => model.id === conversationData.modelId);
       const savedCollectionExists = activeCollections.some((collection) => collection.id === conversationData.collectionId);
+      let loadedConversation = conversationData;
+      let initialCollectionId = savedCollectionExists ? conversationData.collectionId || '' : '';
 
-      setConversation(conversationData);
+      const requiresSelectedKnowledge = settingsData.behavior.responseMode !== 'model_only'
+        && settingsData.behavior.knowledgeScope === 'selected_collection';
+      const searchableCollections = activeCollections.filter((collection) => collection.chunkCount > 0);
+      if (!conversationData.collectionId && requiresSelectedKnowledge && searchableCollections.length === 1) {
+        try {
+          loadedConversation = await nocaiAPI.chat.updateConversation(conversationData.id, {
+            collectionId: searchableCollections[0].id,
+          });
+          initialCollectionId = searchableCollections[0].id;
+        } catch {
+          setError('Could not automatically select the ready knowledge source. Select it from the knowledge menu and try again.');
+        }
+      }
+
+      setConversation(loadedConversation);
       setMessages(messageData);
       setModels(activeModels);
       setCollections(activeCollections);
+      setBehavior(settingsData.behavior);
       setSelectedModel(savedModelIsActive ? conversationData.modelId || '' : activeModels[0]?.id || '');
-      setSelectedCollection(savedCollectionExists ? conversationData.collectionId || '' : '');
+      setSelectedCollection(initialCollectionId);
     } catch (loadFailure) {
-      setLoadError(loadFailure instanceof Error ? loadFailure.message : 'Could not load this conversation.');
+      if (loadSequence.current === sequence) setLoadError(userFacingError(loadFailure, 'Could not load this conversation.'));
     } finally {
-      setLoading(false);
+      if (loadSequence.current === sequence) setLoading(false);
     }
   }, [conversationId, navigate]);
 
   useEffect(() => {
-    loadData();
+    setInput(chatDrafts.get(conversationId || 'new'));
+    setStreaming(false);
+    setCancelling(false);
+    void loadData();
+    return () => {
+      loadSequence.current += 1;
+      const generation = generationRef.current;
+      generationRef.current = null;
+      if (generation) void nocaiAPI.chat.stopGeneration(generation).catch(() => {
+        // The main process owns request cleanup and records failed cancellation.
+      });
+    };
   }, [loadData]);
+
+  useEffect(() => {
+    void refreshReadiness();
+    const timer = window.setInterval(() => void refreshReadiness(), 5000);
+    const unsubscribe = window.nocai?.onBackendStatusChange((status) => {
+      if (status.status === 'ready') void refreshReadiness();
+      else setBackendReady(false);
+    });
+    return () => { window.clearInterval(timer); unsubscribe?.(); };
+  }, [refreshReadiness]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: streaming ? 'auto' : 'smooth' });
@@ -150,26 +240,47 @@ export const ChatView = () => {
 
   const refreshMessages = async (id: string) => {
     const persistedMessages = await nocaiAPI.chat.getMessages(id);
-    setMessages(persistedMessages);
+    if (routeRef.current === id) setMessages(persistedMessages);
   };
 
   const handleSend = async (event: React.FormEvent) => {
     event.preventDefault();
     const content = input.trim();
-    if (!content || streaming || !conversation) return;
-    if (!selectedModel) {
+    if (!content || streaming || generationRef.current || !conversation) return;
+    if (!backendReady || !models.some((model) => model.id === selectedModel)) {
       setError('Activate a chat model before sending a message.');
       return;
     }
 
-    setInput('');
-    if (textareaRef.current) textareaRef.current.style.height = '44px';
+    const requiresSelectedKnowledge = behavior?.responseMode !== 'model_only'
+      && behavior?.knowledgeScope === 'selected_collection';
+    if (requiresSelectedKnowledge) {
+      if (!selectedCollection) {
+        setError('Select a knowledge source with indexed documents before sending this message.');
+        setShowCollectionSelect(true);
+        return;
+      }
+
+      const source = collections.find((collection) => collection.id === selectedCollection);
+      if (!source || source.chunkCount <= 0) {
+        setError(
+          source
+            ? `${source.name} is not ready for chat because it has no searchable chunks. Finish indexing a document or select another source.`
+            : 'The selected knowledge source is unavailable. Select a ready source and try again.'
+        );
+        setShowCollectionSelect(true);
+        return;
+      }
+    }
+
     setStreaming(true);
     setError(null);
 
-    const generationId = `gen-${Date.now()}`;
+    const generationId = conversation.id;
     const temporaryMessageId = `temp-${Date.now()}`;
     setCurrentGenerationId(generationId);
+    generationRef.current = generationId;
+    stopRequested.current = false;
 
     const temporaryUserMessage: Message = {
       id: temporaryMessageId,
@@ -186,6 +297,10 @@ export const ChatView = () => {
     setMessages((current) => [...current, temporaryUserMessage]);
 
     try {
+      const readyModels = await refreshReadiness();
+      if (routeRef.current !== conversation.id || generationRef.current !== generationId) return;
+      if (stopRequested.current) throw new Error('Generation was cancelled.');
+      if (!readyModels.some((model) => model.id === selectedModel)) throw new Error('The chat model is unavailable. Open Models to activate it. Your draft has been kept.');
       const stream = await nocaiAPI.chat.sendMessage({
         conversationId: conversation.id,
         message: content,
@@ -199,6 +314,7 @@ export const ChatView = () => {
       let assistantCitations: Citation[] = [];
 
       for await (const chunk of stream) {
+        if (routeRef.current !== conversation.id || generationRef.current !== generationId) return;
         assistantContent += chunk.delta || '';
         if (chunk.citations) assistantCitations = chunk.citations;
 
@@ -225,29 +341,36 @@ export const ChatView = () => {
       }
 
       await refreshMessages(conversation.id);
+      chatDrafts.set(conversation.id, '');
+      if (routeRef.current === conversation.id) setInput('');
     } catch (sendFailure) {
-      setError(sendFailure instanceof Error ? sendFailure.message : 'Message generation failed.');
+      if (routeRef.current !== conversation.id) return;
+      setError(`${userFacingError(sendFailure, 'Message generation failed.')} Your draft has been kept. Review the conversation before sending again.`);
       try {
         await refreshMessages(conversation.id);
       } catch {
         setMessages((current) => current.filter((message) => message.id !== temporaryMessageId));
       }
     } finally {
-      setStreaming(false);
-      setCurrentGenerationId('');
-      textareaRef.current?.focus();
+      if (generationRef.current === generationId) {
+        generationRef.current = null;
+        setStreaming(false);
+        setCancelling(false);
+        setCurrentGenerationId('');
+        textareaRef.current?.focus();
+      }
     }
   };
 
   const handleStop = async () => {
-    if (!currentGenerationId) return;
+    if (!currentGenerationId || cancelling) return;
+    stopRequested.current = true;
+    setCancelling(true);
     try {
       await nocaiAPI.chat.stopGeneration(currentGenerationId);
     } catch (stopFailure) {
-      setError(stopFailure instanceof Error ? stopFailure.message : 'Could not stop generation.');
-    } finally {
-      setStreaming(false);
-      setCurrentGenerationId('');
+      setError(userFacingError(stopFailure, 'Could not stop generation.'));
+      setCancelling(false);
     }
   };
 
@@ -294,12 +417,19 @@ export const ChatView = () => {
   };
 
   const selectPrompt = (prompt: string) => {
-    setInput(prompt);
+    updateInput(prompt);
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
   const selectedModelObject = models.find((model) => model.id === selectedModel);
+  const canSend = backendReady && Boolean(selectedModelObject) && savingPreference === null;
   const selectedCollectionObject = collections.find((collection) => collection.id === selectedCollection);
+  const knowledgeSelectionEnabled = behavior?.responseMode !== 'model_only' && behavior?.knowledgeScope !== 'all_collections';
+  const knowledgeLabel = behavior?.responseMode === 'model_only'
+    ? 'Knowledge disabled'
+    : behavior?.knowledgeScope === 'all_collections'
+      ? 'All knowledge sources'
+      : selectedCollectionObject?.name || 'Select knowledge source';
 
   if (loading) {
     return (
@@ -348,12 +478,12 @@ export const ChatView = () => {
             <Button
               variant="outline"
               size="sm"
-              className="max-w-56 gap-2"
+              className="h-10 max-w-72 gap-2 px-4 text-sm"
               onClick={() => {
                 setShowModelSelect((open) => !open);
                 setShowCollectionSelect(false);
               }}
-              disabled={savingPreference !== null}
+              disabled={savingPreference !== null || streaming}
               aria-expanded={showModelSelect}
             >
               {savingPreference === 'model' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Brain className="h-4 w-4" />}
@@ -361,17 +491,22 @@ export const ChatView = () => {
               <ChevronDown className="h-4 w-4 flex-none" />
             </Button>
             {showModelSelect && (
-              <div className="absolute right-0 top-full z-20 mt-1 w-72 overflow-hidden rounded-md border border-border bg-popover shadow-lg">
+              <div className="absolute right-0 top-full z-40 mt-2 max-h-[min(70vh,32rem)] w-[min(30rem,calc(100vw-2rem))] overflow-y-auto rounded-lg border border-border bg-popover p-2 shadow-xl">
                 {models.length > 0 ? models.map((model) => (
                   <button
                     key={model.id}
                     onClick={() => handleModelChange(model.id)}
-                    className="flex w-full items-start gap-3 px-3 py-2.5 text-left text-sm hover:bg-accent"
+                    className={clsx(
+                      'flex min-h-16 w-full items-start gap-3 rounded-md px-4 py-3 text-left text-base hover:bg-accent',
+                      selectedModel === model.id && 'bg-accent/70'
+                    )}
                   >
-                    <span className={clsx('mt-1 h-2 w-2 flex-none rounded-full', selectedModel === model.id ? 'bg-primary' : 'bg-transparent')} />
+                    <span className={clsx('mt-1 flex h-5 w-5 flex-none items-center justify-center rounded-full border', selectedModel === model.id ? 'border-primary bg-primary text-primary-foreground' : 'border-border')}>
+                      {selectedModel === model.id && <Check className="h-3 w-3" />}
+                    </span>
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{model.name}</span>
-                      <span className="block truncate text-xs text-muted-foreground">
+                      <span className="block break-words font-semibold leading-snug">{model.name}</span>
+                      <span className="mt-1 block break-words text-sm text-muted-foreground">
                         {[model.parameterCount, model.quantization].filter(Boolean).join(' / ') || 'Active chat model'}
                       </span>
                     </span>
@@ -390,39 +525,53 @@ export const ChatView = () => {
             <Button
               variant="outline"
               size="sm"
-              className="max-w-52 gap-2"
+              className="h-10 max-w-72 gap-2 px-4 text-sm"
               onClick={() => {
                 setShowCollectionSelect((open) => !open);
                 setShowModelSelect(false);
               }}
-              disabled={savingPreference !== null}
+              disabled={savingPreference !== null || streaming || !knowledgeSelectionEnabled}
               aria-expanded={showCollectionSelect}
             >
               {savingPreference === 'collection' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
-              <span className="truncate">{selectedCollectionObject?.name || 'Model only'}</span>
-              <ChevronDown className="h-4 w-4 flex-none" />
+              <span className="truncate">{knowledgeLabel}</span>
+              {knowledgeSelectionEnabled && <ChevronDown className="h-4 w-4 flex-none" />}
             </Button>
             {showCollectionSelect && (
-              <div className="absolute right-0 top-full z-20 mt-1 w-72 overflow-hidden rounded-md border border-border bg-popover shadow-lg">
+              <div className="absolute right-0 top-full z-40 mt-2 max-h-[min(70vh,32rem)] w-[min(30rem,calc(100vw-2rem))] overflow-y-auto rounded-lg border border-border bg-popover p-2 shadow-xl">
                 <button
                   onClick={() => handleCollectionChange('')}
-                  className="flex w-full items-center gap-3 px-3 py-2.5 text-left text-sm hover:bg-accent"
+                  className={clsx(
+                    'flex min-h-16 w-full items-center gap-3 rounded-md px-4 py-3 text-left text-base hover:bg-accent',
+                    !selectedCollection && 'bg-accent/70'
+                  )}
                 >
-                  <span className={clsx('h-2 w-2 rounded-full', !selectedCollection ? 'bg-primary' : 'bg-transparent')} />
-                  <span className="font-medium">Model only</span>
+                  <span className={clsx('flex h-5 w-5 flex-none items-center justify-center rounded-full border', !selectedCollection ? 'border-primary bg-primary text-primary-foreground' : 'border-border')}>
+                    {!selectedCollection && <Check className="h-3 w-3" />}
+                  </span>
+                  <span>
+                    <span className="block font-semibold">No source selected</span>
+                    <span className="mt-1 block text-sm text-muted-foreground">Knowledge-only mode will decline unsupported questions.</span>
+                  </span>
                 </button>
                 {collections.map((collection) => (
                   <button
                     key={collection.id}
                     onClick={() => handleCollectionChange(collection.id)}
-                    className="flex w-full items-start gap-3 border-t border-border px-3 py-2.5 text-left text-sm hover:bg-accent"
+                    className={clsx(
+                      'mt-1 flex min-h-20 w-full items-start gap-3 rounded-md px-4 py-3 text-left text-base hover:bg-accent',
+                      selectedCollection === collection.id && 'bg-accent/70'
+                    )}
                   >
-                    <span className={clsx('mt-1 h-2 w-2 flex-none rounded-full', selectedCollection === collection.id ? 'bg-primary' : 'bg-transparent')} />
+                    <span className={clsx('mt-1 flex h-5 w-5 flex-none items-center justify-center rounded-full border', selectedCollection === collection.id ? 'border-primary bg-primary text-primary-foreground' : 'border-border')}>
+                      {selectedCollection === collection.id && <Check className="h-3 w-3" />}
+                    </span>
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{collection.name}</span>
-                      <span className="block text-xs text-muted-foreground">
-                        {collection.documentCount} document{collection.documentCount === 1 ? '' : 's'}
+                      <span className="block break-words font-semibold leading-snug">{collection.name}</span>
+                      <span className="mt-1 block text-sm text-muted-foreground">
+                        {collection.documentCount} document{collection.documentCount === 1 ? '' : 's'} · {collection.chunkCount} searchable chunks
                       </span>
+                      {collection.description && <span className="mt-1 line-clamp-2 block text-sm text-muted-foreground">{collection.description}</span>}
                     </span>
                   </button>
                 ))}
@@ -488,12 +637,13 @@ export const ChatView = () => {
       )}
 
       <div className="flex-none border-t border-border bg-background px-4 py-3 sm:px-6">
+        <p className="mx-auto mb-2 max-w-4xl text-xs text-muted-foreground" role="status">{cancelling ? 'Cancelling response...' : streaming ? 'Generating response...' : !backendReady ? 'Disconnected. Your draft remains available.' : selectedModelObject ? 'Chat model ready' : 'Activate a chat model in Models to send. You can prepare a draft now.'}</p>
         <form onSubmit={handleSend} className="mx-auto flex w-full max-w-4xl items-end gap-2">
           <textarea
             ref={textareaRef}
             value={input}
             onChange={(event) => {
-              setInput(event.target.value);
+              updateInput(event.target.value);
               event.currentTarget.style.height = '44px';
               event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 160)}px`;
             }}
@@ -504,18 +654,19 @@ export const ChatView = () => {
               }
             }}
             placeholder={streaming ? 'Generating response...' : selectedModel ? 'Ask about an incident, runbook, or change...' : 'Activate a chat model to begin'}
-            disabled={streaming || !selectedModel}
+            disabled={streaming}
+            maxLength={32768}
             className="min-h-11 max-h-40 flex-1 resize-none rounded-md border border-input bg-card px-3.5 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
             rows={1}
             aria-label="Message"
           />
           {streaming ? (
-            <Button type="button" variant="outline" onClick={handleStop} className="h-11 gap-2 text-destructive">
+            <Button type="button" variant="outline" onClick={handleStop} disabled={cancelling} aria-label={cancelling ? 'Cancelling response' : 'Stop response'} className="h-11 gap-2 text-destructive">
               <Square className="h-4 w-4" />
-              <span className="hidden sm:inline">Stop</span>
+              <span className="hidden sm:inline">{cancelling ? 'Cancelling' : 'Stop'}</span>
             </Button>
           ) : (
-            <Button type="submit" className="h-11 w-11 p-0" disabled={!input.trim() || !selectedModel} aria-label="Send message">
+            <Button type="submit" className="h-11 w-11 p-0" disabled={!input.trim() || !canSend} aria-label="Send message">
               <Send className="h-4 w-4" />
             </Button>
           )}

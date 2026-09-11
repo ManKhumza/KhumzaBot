@@ -20,6 +20,33 @@ for up to five rounds. Logs and the session ID are stored under
 `.artifacts\nemotron\runs`; the current gate result is
 `.artifacts\nemotron\quality-report.json`.
 
+While Nemotron is working, the harness streams stdout/stderr and prints a
+heartbeat every 15 seconds with elapsed and idle time. A watchdog stops a truly
+silent process after 30 minutes or any single agent turn after four hours. The
+same OpenCode session is then resumed with bounded exponential backoff for up to
+three transient provider/CLI failures. These generous defaults can be tuned for
+especially large jobs:
+
+```powershell
+.\scripts\nemotron-harness.ps1 -MaxAgentMinutes 360 -InactivityMinutes 45 `
+  -HeartbeatSeconds 10 -ProviderRetries 4
+```
+
+Machine-readable live state is written to the run's `status.json`. Each attempt
+has separate stdout/stderr logs, and `round-N-agent.log` contains the combined
+post-run diagnostic. Timeout exits use code 124 and include the exact watchdog
+reason. The independent quality gate still runs, so useful work is measured even
+when the provider fails after making changes.
+
+To continue an existing OpenCode session rather than create a new one:
+
+```powershell
+.\scripts\nemotron-harness.ps1 -SessionId ses_your_session_id
+```
+
+Find session IDs with `opencode session list -n 20 --format json`. Do not run a
+second harness concurrently against the same session or working tree.
+
 The gate also enforces a minimum test inventory across the risk areas named in
 the remediation prompt. This prevents a three-test smoke suite from being
 mistaken for professional-grade coverage; the tests must both exist and pass.

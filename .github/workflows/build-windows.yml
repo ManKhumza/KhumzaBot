@@ -17,7 +17,8 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
-  NODE_VERSION: "20"
+  NODE_VERSION: "24"
+  NOC_AI_CHAT_TEST_MODEL: ${{ vars.NOC_AI_CHAT_TEST_MODEL }}
 
 jobs:
   build-and-verify:
@@ -36,11 +37,18 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Create repository virtual environment
+      - name: Check local chat model fixture
         shell: pwsh
         run: |
-          python -m venv .venv
-          ./.venv/Scripts/python.exe -m pip install --disable-pip-version-check -e "./backend[dev]"
+          $fixture = $env:NOC_AI_CHAT_TEST_MODEL
+          if (-not $fixture) { $fixture = Join-Path $PWD 'resources/models/Qwen3-4B-Q4_K_M.gguf' }
+          if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+            throw 'A local chat GGUF fixture is required. Provision it on the runner and set NOC_AI_CHAT_TEST_MODEL to its path.'
+          }
+
+      - name: Bootstrap build dependencies and runtimes
+        shell: pwsh
+        run: ./scripts/build-all.ps1 -SkipPackaging
 
       - name: Run clean package quality gate
         shell: pwsh

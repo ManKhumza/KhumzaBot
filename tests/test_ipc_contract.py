@@ -146,7 +146,7 @@ def test_electron_allows_first_run_model_initialization():
     main_path = Path(__file__).parents[1] / "apps" / "desktop" / "electron" / "main.ts"
     main_content = main_path.read_text()
 
-    assert "await waitForPort(backendPort!, 60000)" in main_content
+    assert "await waitForPort(backendPort!, 60000, signal)" in main_content
     assert "Backend exited before opening its local port" in main_content
 
 
@@ -159,6 +159,16 @@ def test_electron_ipc_waits_for_backend_startup():
     assert "backendStartupPromise = startupPromise" in main_content
     assert "await nativeFetch(`http://127.0.0.1:${backendPort}/health/ready`" in main_content
     assert "if (!sessionToken) return null" in main_content
+
+
+def test_missing_preload_bridge_cannot_deadlock_authentication():
+    """Renderer startup fails visibly when the preload bridge is unavailable."""
+    api_path = Path(__file__).parents[1] / "apps" / "desktop" / "renderer" / "src" / "utils" / "api.ts"
+    api_content = api_path.read_text(encoding="utf-8")
+
+    assert "if (!window.nocai)" in api_content
+    assert "Desktop integration failed to load" in api_content
+    assert "window.addEventListener('nocai:ready'" not in api_content
 
 
 def test_renderer_treats_backend_timestamps_as_utc():
@@ -184,6 +194,23 @@ def test_large_document_picker_and_upload_contract():
     assert "JSON.stringify({ filePaths })" in main_content
     assert "selectDocuments: () => ipcRenderer.invoke('nocai:knowledge:selectDocuments')" in preload_content
     assert "uploadFiles.map((file) => file.path)" in knowledge_content
+
+
+def test_renderer_exposes_readable_chat_selectors_behavior_and_source_deletion():
+    """Renderer UX: chat controls are readable and admin knowledge controls are reachable."""
+    root = Path(__file__).parents[1]
+    chat_content = (root / "apps" / "desktop" / "renderer" / "src" / "pages" / "ChatView.tsx").read_text()
+    settings_content = (root / "apps" / "desktop" / "renderer" / "src" / "pages" / "Settings.tsx").read_text()
+    knowledge_content = (root / "apps" / "desktop" / "renderer" / "src" / "pages" / "Knowledge.tsx").read_text()
+
+    assert "w-[min(30rem,calc(100vw-2rem))]" in chat_content
+    assert "max-h-[min(70vh,32rem)]" in chat_content
+    assert "All knowledge sources" in chat_content
+    assert "label: 'Behavior'" in settings_content
+    assert "Where answers may come from" in settings_content
+    assert "Citation format" in settings_content
+    assert "Delete Source" in knowledge_content
+    assert "setShowDeleteCollectionConfirm(true)" in knowledge_content
 
 
 def test_renderer_failure_is_contained_and_recoverable():

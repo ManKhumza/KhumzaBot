@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 from typing import Literal, Optional
 from copy import deepcopy
@@ -15,6 +15,7 @@ class SettingsResponse(BaseModel):
     appearance: dict
     models: dict
     knowledge: dict
+    behavior: dict
     storage: dict
     security: dict
     diagnostics: dict
@@ -58,6 +59,23 @@ class KnowledgeSettingsUpdate(SettingsUpdateModel):
         return self
 
 
+class BehaviorSettingsUpdate(SettingsUpdateModel):
+    systemInstructions: Optional[str] = Field(None, max_length=12_000)
+    responseMode: Optional[Literal["knowledge_only", "knowledge_preferred", "model_only"]] = None
+    knowledgeScope: Optional[Literal["selected_collection", "all_collections"]] = None
+    citationStyle: Optional[Literal["inline", "sources_list", "inline_and_sources"]] = None
+    noKnowledgeResponse: Optional[str] = Field(None, min_length=1, max_length=1_000)
+    maxSources: Optional[int] = Field(None, ge=1, le=20)
+    minimumRelevanceScore: Optional[float] = Field(None, ge=0, le=1)
+
+    @field_validator("noKnowledgeResponse")
+    @classmethod
+    def no_knowledge_response_must_not_be_blank(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("noKnowledgeResponse must not be blank")
+        return value
+
+
 class StorageSettingsUpdate(SettingsUpdateModel):
     dataLocation: Optional[str] = Field(None, max_length=4096)
     modelStorage: Optional[str] = Field(None, max_length=4096)
@@ -83,6 +101,7 @@ class UpdateSettingsRequest(SettingsUpdateModel):
     appearance: Optional[AppearanceSettingsUpdate] = None
     models: Optional[ModelSettingsUpdate] = None
     knowledge: Optional[KnowledgeSettingsUpdate] = None
+    behavior: Optional[BehaviorSettingsUpdate] = None
     storage: Optional[StorageSettingsUpdate] = None
     security: Optional[SecuritySettingsUpdate] = None
     diagnostics: Optional[DiagnosticsSettingsUpdate] = None
@@ -109,6 +128,20 @@ DEFAULT_SETTINGS = {
         "hybridAlpha": 0.5,
         "enableReranking": False,
         "rerankerModelId": None,
+    },
+    "behavior": {
+        "systemInstructions": (
+            "Act as a careful NOC operations assistant. Be concise, state uncertainty, "
+            "and never invent operational facts."
+        ),
+        "responseMode": "knowledge_only",
+        "knowledgeScope": "selected_collection",
+        "citationStyle": "inline_and_sources",
+        "noKnowledgeResponse": (
+            "I could not find enough relevant information in the configured knowledge source to answer that."
+        ),
+        "maxSources": 5,
+        "minimumRelevanceScore": 0.55,
     },
     "storage": {
         "dataLocation": "",
@@ -140,22 +173,28 @@ def _merge_settings(base: dict, updates: dict) -> dict:
     return result
 
 
-@router.get("/settings", response_model=SettingsResponse)
-async def get_settings(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
+def load_effective_settings(db: Session, current_user: User) -> dict:
+    """Return fresh global settings with the current user's permitted overrides."""
     result = deepcopy(DEFAULT_SETTINGS)
     settings_row = db.query(Setting).filter(Setting.key == "global", Setting.user_id.is_(None)).first()
     if settings_row:
         result = _merge_settings(result, settings_row.setting_value)
 
     user_settings = db.query(Setting).filter(Setting.user_id == current_user.id).all()
-    for s in user_settings:
-        if s.key in result and isinstance(s.setting_value, dict):
-            result[s.key] = {**result[s.key], **(s.setting_value or {})}
-    
-    return SettingsResponse(**result)
+    for setting in user_settings:
+        if setting.key == "behavior":
+            continue
+        if setting.key in result and isinstance(setting.setting_value, dict):
+            result[setting.key] = {**result[setting.key], **(setting.setting_value or {})}
+    return result
+
+
+@router.get("/settings", response_model=SettingsResponse)
+async def get_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return SettingsResponse(**load_effective_settings(db, current_user))
 
 @router.patch("/settings", response_model=SettingsResponse)
 async def update_settings(
@@ -164,7 +203,10 @@ async def update_settings(
     db: Session = Depends(get_db)
 ):
     updates = request.model_dump(exclude_unset=True, exclude_none=True)
-    if "administrator" in current_user.roles:
+    is_administrator = "administrator" in current_user.roles
+    if "behavior" in updates and not is_administrator:
+        raise HTTPException(403, "Only administrators can change assistant behavior")
+    if is_administrator:
         settings_row = db.query(Setting).filter(Setting.key == "global", Setting.user_id.is_(None)).first()
         if not settings_row:
             settings_row = Setting(key="global", user_id=None, setting_value=deepcopy(DEFAULT_SETTINGS))

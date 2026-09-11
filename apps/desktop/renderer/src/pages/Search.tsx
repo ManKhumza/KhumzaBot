@@ -7,6 +7,7 @@ import { Badge } from '@/components/common/Badge';
 import { Search as SearchIcon, Loader2, FileText, ChevronDown, ChevronUp, Copy, Eye, Database } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { SearchResult } from '@/types';
+import { userFacingError } from '@/utils/errors';
 
 export const Search = () => {
   const [query, setQuery] = useState('');
@@ -18,6 +19,8 @@ export const Search = () => {
   const [hybridAlpha, setHybridAlpha] = useState(0.5);
   const [enableReranking, setEnableReranking] = useState(false);
   const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     loadCollections();
@@ -28,13 +31,14 @@ export const Search = () => {
       const data = await nocaiAPI.knowledge.listCollections();
       setCollections(data);
     } catch (error) {
-      console.error('Failed to load collections:', error);
+      setError(userFacingError(error, 'Could not load knowledge collections.'));
     }
   };
 
   const handleSearch = async () => {
-    if (!query.trim()) return;
+    if (!query.trim() || loading) return;
     setLoading(true);
+    setError(null);
     try {
       const data = await nocaiAPI.knowledge.search({
         query: query.trim(),
@@ -46,7 +50,7 @@ export const Search = () => {
       });
       setResults(data);
     } catch (error) {
-      console.error('Search failed:', error);
+      setError(userFacingError(error, 'Knowledge search failed. Check diagnostics and retry.'));
     } finally {
       setLoading(false);
     }
@@ -71,12 +75,15 @@ export const Search = () => {
     });
   };
 
-  const copyContent = (content: string) => {
-    navigator.clipboard.writeText(content);
+  const copyContent = async (content: string) => {
+    try { await navigator.clipboard.writeText(content); setNotice('Search result copied.'); }
+    catch { setError('Could not copy the result. Select the text and copy it manually.'); }
   };
 
   return (
     <div className="space-y-6">
+      {error && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">{error}</div>}
+      {notice && <p role="status" className="text-sm">{notice}</p>}
       {/* Header */}
       <div>
         <h1 className="text-2xl font-bold text-foreground">Search Knowledge</h1>
@@ -155,10 +162,11 @@ export const Search = () => {
                 <input
                   type="checkbox"
                   checked={enableReranking}
-                  onChange={(e) => setEnableReranking(e.target.checked)}
+                  disabled
+                  title="Reranking requires a supported local reranker runtime."
                   className="w-4 h-4 rounded border-input text-primary focus:ring-primary"
                 />
-                <span className="text-sm">Enable reranking</span>
+                <span className="text-sm">Reranking unavailable: no supported reranker runtime</span>
               </label>
 
               <Button onClick={handleSearch} isLoading={loading} disabled={!query.trim() || loading}>

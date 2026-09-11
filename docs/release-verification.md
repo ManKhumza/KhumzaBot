@@ -1,432 +1,78 @@
-# NOC AI Assistant - Release Verification
+﻿# Windows release verification
 
-## Pre-Release Checklist
+This is a procedure and result template, not a claim that its cases passed. Record results against one build ID and artifact hash. Use [build-guide.md](build-guide.md) for prerequisites and current commands and [NEMOTRON_FINAL_REMEDIATION_PROMPT.md](../NEMOTRON_FINAL_REMEDIATION_PROMPT.md) for completion requirements.
 
-### Code Quality
-- [ ] All TypeScript strict checks pass (`npm run typecheck`)
-- [ ] ESLint passes (`npm run lint`)
-- [ ] Python type hints valid (`mypy backend/`)
-- [ ] Unit tests pass (`pytest backend/tests/`)
-- [ ] Integration tests pass
+## Automated evidence
 
-### Security
-- [ ] CSP headers configured
-- [ ] No `eval()` or `Function()` in renderer
-- [ ] `contextIsolation: true` in Electron
-- [ ] `nodeIntegration: false` in Electron
-- [ ] Session token validation on all endpoints
-- [ ] Argon2id parameters: memory≥64MB, time≥3
-- [ ] Path traversal protection
-- [ ] File type validation (extension + MIME)
-- [ ] No outbound network calls in production
+From a prepared repository root:
 
-### Functionality
-- [ ] Authentication flow works
-- [ ] Role-based access control enforced
-- [ ] Model import/scan/activate works
-- [ ] Document upload/processing works
-- [ ] Chat streaming works
-- [ ] Citations appear correctly
-- [ ] Search returns results
-- [ ] Admin functions work
-- [ ] Settings persist
-- [ ] Backup/restore works
-
-### Packaging
-- [ ] NSIS installer builds
-- [ ] Portable ZIP builds
-- [ ] SHA256 checksums generated
-- [ ] Installer tested on clean Windows 10/11
-- [ ] Portable version tested
-- [ ] Uninstall preserves data by default
-- [ ] Code signing verified (production)
-
----
-
-## Clean Machine Installation Test
-
-### Test Environment
-- Fresh Windows 10/11 VM (no dev tools)
-- No Node.js, Python, Visual Studio
-- No llama.cpp, PostgreSQL, Docker
-- Standard user account (non-admin)
-
-### Test Procedure
-
-#### 1. Install
 ```powershell
-# Run installer
-.\NOC-AI-Assistant-Setup-1.0.0.exe
-
-# Verify:
-# - Installation completes without errors
-# - Start Menu shortcut created
-# - Desktop shortcut created (if selected)
-# - Installation directory populated
+.\scripts\quality-gate.ps1 -Package -SoakMinutes 60
 ```
 
-#### 2. First Launch
+Require exit 0 and inspect `.artifacts/nemotron/quality-report.json`. Preserve the report and referenced gate logs before another run overwrites them. Record the generated timestamp, package/soak options, each result, and source/build identity. Retain desktop workflow resource snapshots and elapsed time with the release evidence. Do not infer a 60-minute run from a test name or from the short two-cycle CI variant.
+
+For the command above, the extended duration applies to the packaged workflow; source desktop checks use the short CI cycles. Each completed cycle updates `workflow-resource-snapshots.json` under `.artifacts/desktop-tests`. Confirm at least 60 minutes of workflow elapsed time and inspect every recorded threshold result.
+
+The automated desktop tests use temporary synthetic profiles and exercise onboarding, sign-in errors, forced password change, navigation, restore confirmation, actual bundled BGE ingestion/retrieval, cited local chat, backend restart persistence, process cleanup, backend death, renderer crash, and concurrent restarts. Read the current [desktop tests](../apps/desktop/electron/e2e) for exact assertions. The workflow monitors process count, handles, threads, memory and log size; the backend suite also checks database locking/integrity and bounded resources.
+
+The package gate launches `apps/desktop/electron/release/win-unpacked/NOC AI Assistant.exe`. This validates packaged application behavior, but leaves the actual installer, portable launcher, Windows elevation behavior, shortcuts/registration, upgrade, and uninstall to the lifecycle cases below. Do not label unpacked-app execution as a completed installer test.
+
+## Artifact and signature record
+
+Use current output from `apps/desktop/electron/release/RELEASE-INFO.json` and `SHA256SUMS.txt`, then independently verify it:
+
 ```powershell
-# Launch from Start Menu
-# Verify:
-# - Splash screen appears
-# - Backend starts (within 30 seconds)
-# - Login screen appears
-# - No console windows visible
+.\scripts\verify-packaging.ps1 -InstallerPath apps/desktop/electron/release
+.\.venv\Scripts\python.exe scripts/release_integrity.py --release apps/desktop/electron/release
+Get-ChildItem -LiteralPath apps/desktop/electron/release -File -Filter '*.exe' |
+    ForEach-Object {
+        [pscustomobject]@{
+            Name = $_.Name
+            Bytes = $_.Length
+            SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+            Authenticode = (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status.ToString()
+        }
+    }
 ```
 
-#### 3. Login & Setup
+Record version, build ID, source revision or source-manifest identity, distribution label, filenames, byte sizes, SHA-256 values, and signature status. Expected primary outputs are `NOC-AI-Assistant-Setup-<VERSION>.exe` and `NOC-AI-Assistant-Portable-<VERSION>.exe`; the portable artifact is an executable.
+
+For a requested signed release:
+
 ```powershell
-# Login with default credentials
-# Username: admin
-# Password: ChangeMe123!
-# Verify:
-# - Forced password change
-# - Dashboard loads
-# - System health shows "Healthy"
+.\scripts\verify-packaging.ps1 -InstallerPath apps/desktop/electron/release -RequireSignature
 ```
 
-#### 4. Model Import
-```powershell
-# Go to Models page
-# Click "Scan Directory" or "Import Model"
-# Select a local GGUF file
-# Verify:
-# - Model detected and validated
-# - Hardware compatibility shown
-# - Import succeeds
-# - Model appears in list
-```
+The signing setup and missing-certificate behavior are documented in the build guide. An unsigned development build may pass the ordinary package gate. It must remain labeled unsigned and must not be reported as an approved signed distribution. Record valid installed app, embedded runtime, and uninstaller signatures during signed lifecycle verification.
 
-#### 5. Model Activation
-```powershell
-# Click "Activate" on chat model
-# Verify:
-# - Status changes to "Active"
-# - Loading completes within 30 seconds
-# - No console windows appear
-```
+## Isolated Windows lifecycle checklist
 
-#### 6. Knowledge Base
-```powershell
-# Go to Knowledge page
-# Create collection
-# Upload test documents (.txt, .pdf, .md)
-# Verify:
-# - Documents process through all stages
-# - Status reaches "Ready"
-# - Chunk count > 0
-```
+Use a disposable Windows VM or equivalent isolated test installation with a dedicated standard user account and no existing NOC AI Assistant data. The entire Windows user profile must belong to the disposable test environment. Never run install, upgrade, uninstall, or reset cases against the developer's real `%APPDATA%\NOC AI Assistant` profile. Use synthetic documents, fresh credentials, and locally supplied test models. Keep Windows security features enabled.
 
-#### 7. Chat with Knowledge
-```powershell
-# Go to Chats → New Chat
-# Select knowledge collection
-# Ask question about documents
-# Verify:
-# - Streaming response
-# - Citations appear
-# - Citation preview works
-# - Source preview opens
-```
+Record Windows version, account type, architecture, security settings, build ID and Setup/Portable hashes before each run. Do not claim a Windows version was tested because it appears in a checklist. Record each result as **Pass**, **Fail**, **Blocked**, or **Not run**, with a timestamp and sanitized evidence location.
 
-#### 8. Model-Only Chat
-```powershell
-# New chat without knowledge collection
-# Verify:
-# - "Knowledge: None" indicator
-# - Normal LLM responses
-# - No citations shown
-```
+| Case | Procedure and required evidence | Result |
+| --- | --- | --- |
+| Per-user installation | Run Setup through the normal per-user route from the standard account. Verify installation completes without Administrator/UAC elevation, the selected destination contains the app, and requested Start Menu/Desktop shortcuts point to it. The configuration uses `perMachine: false` and `requestedExecutionLevel: asInvoker`; configuration alone is not this test. | Not run |
+| First launch | Launch the installed shortcut. Verify a usable onboarding screen, responsive UI, a ready local backend and bundled embedding runtime, and no console windows or secret-bearing errors. | Not run |
+| Administrator creation | Create a local administrator in the onboarding form with a fresh password meeting the displayed policy. There are no assumed/default credentials. Test sign-out, wrong-password error and successful sign-in. Do not record credentials. | Not run |
+| Navigation | Open Chats, Knowledge, Search, Models, Settings, Diagnostics, and every visible administrator/menu route. Verify one usable application shell, readable failures, and no blank screens or silent actions. | Not run |
+| Local model and chat | Import a compatible local chat GGUF, activate it, obtain a nonempty completion through the visible composer, then cancel another generation. Verify truthful model/generation state and useful errors after a runtime failure. | Not run |
+| Ingestion and retrieval | Upload synthetic TXT, CSV, HTML, DOCX and PDF documents. Observe durable jobs, progress, positive chunk counts and ready status. Search for fixture content, verify source metadata and cited chat context. Check corrupt/empty input produces an actionable failure and retry/cancel work. | Not run |
+| Settings, sessions and restart | Change a setting and create a conversation. Close and relaunch, sign in as required, and verify settings, messages and source data persist. Verify reported model readiness matches actual runtime recovery. | Not run |
+| Backup and restore | Back up synthetic data, change it, and restore through the explicit UI confirmation. Verify restored state and rejection of an invalid archive. Retain a verified backup before destructive lifecycle cases. | Not run |
+| Recovery and diagnostics | Terminate only test-owned backend, llama.cpp and renderer processes in controlled cases. Verify bounded recovery, sanitized diagnostics, responsive navigation, preserved records and no duplicate children. | Not run |
+| Close and reboot | Close normally and verify the app's backend/llama.cpp descendants exit. Reboot the disposable VM, relaunch and verify persistence and runtime health. | Not run |
+| Upgrade from prior release | Restore a clean VM snapshot, install the actual prior release, create synthetic users/documents/chats/settings and retain a backup. Close it, install this release over it and verify the same data remains usable, migrations complete, and resources/version reflect this build. Record both installer hashes. | Not run |
+| Uninstall with preservation | Close the app and run its installed uninstaller. Verify app files, shortcuts and registration are removed, no owned children remain, and synthetic user data/models are preserved by default. Reinstall and verify the preserved data is usable. | Not run |
+| Explicit data removal | In a separate disposable snapshot with a verified backup, test only an explicitly offered/supported removal action and verify its scope and confirmation. Current builder configuration does not include the legacy `installer.nsh` data-removal checkbox; do not claim that checkbox is available. | Not run |
+| Portable launcher | Launch the actual Portable executable in the disposable standard account, repeat onboarding/local embedding/chat/close checks, and confirm no owned backend/llama.cpp processes remain. Do not substitute `win-unpacked` for this case. | Not run |
+| Offline use | Disconnect only the disposable test machine's network after dependencies/models are available, repeat local workflows, and verify observed traffic is limited to expected loopback services. Keep Defender, Smart App Control, UAC, and application isolation enabled. | Not run |
+| Signed distribution | When signing is requested, verify Authenticode status of the installed app, executable runtime dependencies, installer and installed uninstaller; verify the standard-user install/launch route with Windows security enabled. | Not run |
 
-#### 9. Search
-```powershell
-# Go to Search page
-# Enter query
-# Verify:
-# - Results returned
-# - Expand/collapse works
-# - Copy button works
-```
+The active NSIS configuration preserves app data by default. Electron builder's stock uninstaller recognizes an explicit `--delete-app-data` option; that is not evidence of a visible confirmation workflow or tested recovery. Do not run it on a real user profile. Legacy `test-version-1.0.5-installation.ps1`, `verify-installer-status.ps1`, and `final-installer-check.ps1` do not establish lifecycle results.
 
-#### 10. Settings
-```powershell
-# Change theme (Light/Dark/System)
-# Change model parameters
-# Verify persistence after restart
-```
+## Release decision
 
-#### 11. Admin Functions
-```powershell
-# Login as admin
-# Go to Administration
-# Verify:
-# - User management works
-# - Audit log shows events
-# - Jobs page shows ingestion jobs
-# - Health page shows all green
-```
-
-#### 12. Restart Test
-```powershell
-# Close application completely
-# Re-launch from Start Menu
-# Verify:
-# - No re-login required (session persists)
-# - Models still active
-# - Conversations preserved
-# - Settings preserved
-```
-
-#### 13. Reboot Test
-```powershell
-# Restart Windows VM
-# Log in
-# Launch application
-# Verify all functionality works
-```
-
-#### 14. Uninstall Test
-```powershell
-# Settings → Apps → Uninstall
-# Choose "Keep user data"
-# Verify:
-# - Application removed
-# - Start Menu/Desktop shortcuts removed
-# - Data directory preserved: %APPDATA%\NOC AI Assistant\
-# - Reinstall works
-```
-
----
-
-## Offline Verification
-
-### Network Isolation Test
-```powershell
-# Disable network adapter
-# Or use firewall rule:
-New-NetFirewallRule -DisplayName "Block NOC AI" -Direction Outbound -Program "C:\Program Files\NOC AI Assistant\NOC AI Assistant.exe" -Action Block
-
-# Test all functionality:
-# - Login
-# - Chat
-# - Model loading
-# - Document processing
-# - Search
-# - Settings
-# - Admin
-
-# Verify: NO outbound connections in Process Monitor / Wireshark
-```
-
-### Expected Network Activity
-| Component | Connections | Destination |
-|-----------|-------------|-------------|
-| Electron | None | - |
-| Backend | Loopback only | 127.0.0.1:<port> |
-| llama.cpp | None | - |
-| Total | 1 local connection | 127.0.0.1 |
-
-### Verification Command
-```powershell
-# Check backend connections
-Get-NetTCPConnection -OwningProcess (Get-Process nocai-backend).Id -State Established
-
-# Should show only 127.0.0.1
-```
-
----
-
-## Performance Benchmarks
-
-### Target Metrics
-| Metric | Target | Measurement |
-|--------|--------|-------------|
-| Cold start | < 5 seconds | App launch to UI ready |
-| Backend startup | < 10 seconds | Backend process to health ready |
-| Model load (7B Q4) | < 15 seconds | Activate to ready |
-| First token | < 2 seconds | Chat request to first token |
-| Embedding (1 doc) | < 1 second | Single document |
-| Vector search (10K) | < 500ms | Top-10 retrieval |
-| Hybrid search | < 1 second | Vector + FTS + RRF |
-
-### Test Commands
-```powershell
-# Measure startup
-Measure-Command { Start-Process "NOC AI Assistant.exe" }
-
-# Measure model load
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-# Click Activate in UI
-$sw.Stop()
-$sw.ElapsedMilliseconds
-
-# Measure generation
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-# Send chat message
-$sw.Stop()
-$sw.ElapsedMilliseconds
-```
-
----
-
-## Compatibility Matrix
-
-### Windows Versions
-| Version | Supported | Tested |
-|---------|-----------|--------|
-| Windows 10 21H2+ | Yes | ✅ |
-| Windows 11 22H2+ | Yes | ✅ |
-| Windows Server 2019+ | Yes | ⚠️ |
-
-### Hardware Requirements
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| CPU | 2 cores | 8+ cores |
-| RAM | 8 GB | 32 GB |
-| GPU | None | NVIDIA RTX 3060+ (8GB VRAM) |
-| Disk | 10 GB | 100 GB SSD |
-| VRAM | 0 GB | 8+ GB |
-
-### Model Compatibility
-| Model Size | Quantization | RAM Needed | GPU VRAM |
-|------------|-------------|------------|----------|
-| 1B | Q4_K_M | ~2 GB | 0 GB |
-| 3B | Q4_K_M | ~4 GB | 2 GB |
-| 7B | Q4_K_M | ~6 GB | 4 GB |
-| 13B | Q4_K_M | ~10 GB | 8 GB |
-| 70B | Q4_K_M | ~48 GB | 24+ GB |
-
----
-
-## Regression Test Suite
-
-### Automated Tests
-```powershell
-# Backend tests
-cd backend
-.\.venv\Scripts\pytest.exe tests/ -v --cov=backend
-
-# Frontend tests
-cd apps/desktop/renderer
-npm test
-
-# E2E tests (if implemented)
-# npm run test:e2e
-```
-
-### Critical User Flows
-1. **Login → Chat → Logout**
-2. **Model Import → Activate → Chat**
-3. **Collection Create → Upload → Process → Search → Chat**
-4. **User Create → Login as User → Chat**
-5. **Backup → Restore → Verify Data**
-
----
-
-## Signing & Distribution Verification
-
-### Code Signing
-```powershell
-# Verify signature
-signtool verify /pa /v "NOC-AI-Assistant-Setup-1.0.0.exe"
-
-# Check timestamp
-signtool verify /pa /v /tr http://timestamp.digicert.com "NOC-AI-Assistant-Setup-1.0.0.exe"
-
-# Certificate details
-signtool verify /pa /v "NOC-AI-Assistant-Setup-1.0.0.exe" 2>&1 | Select-String "Subject"
-```
-
-### Checksum Verification
-```powershell
-# Verify SHA256SUMS.txt
-Get-FileHash -Path "NOC-AI-Assistant-Setup-1.0.0.exe" -Algorithm SHA256
-Get-FileHash -Path "NOC-AI-Assistant-Portable-1.0.0.zip" -Algorithm SHA256
-
-# Compare with SHA256SUMS.txt
-Get-Content SHA256SUMS.txt
-```
-
-### VirusTotal Scan
-```powershell
-# Upload to VirusTotal (manual)
-# Or use VT CLI:
-# vt scan file "NOC-AI-Assistant-Setup-1.0.0.exe"
-# vt analysis <id>
-```
-
----
-
-## Release Artifacts Checklist
-
-### Required Files
-```
-dist/
-├── NOC-AI-Assistant-Setup-1.0.0.exe      ✅
-├── NOC-AI-Assistant-Portable-1.0.0.zip   ✅
-├── SHA256SUMS.txt                        ✅
-└── RELEASE-NOTES.md                      ✅
-```
-
-### SHA256SUMS.txt Format
-```
-<sha256-hash>  NOC-AI-Assistant-Setup-1.0.0.exe
-<sha256-hash>  NOC-AI-Assistant-Portable-1.0.0.zip
-```
-
-### RELEASE-NOTES.md Template
-```markdown
-# NOC AI Assistant 1.0.0
-
-## Highlights
-- Initial release
-- Local-first AI assistant for NOC environments
-- GGUF model support with hardware detection
-- Document ingestion with RAG
-- Multi-user with RBAC
-
-## New Features
-- [Feature 1]
-- [Feature 2]
-
-## Bug Fixes
-- [Fix 1]
-
-## Known Issues
-- [Issue 1]
-
-## Upgrade Notes
-- Fresh install required for v1.0.0
-```
-
----
-
-## Post-Release Monitoring
-
-### Metrics to Track
-- Installer download count
-- Installation success rate (telemetry disabled, use voluntary reports)
-- Crash reports (if enabled)
-- Common error patterns in logs
-- Performance metrics from voluntary diagnostics
-
-### Support Channels
-- GitHub Issues for bugs
-- Documentation for common issues
-- Diagnostic export for complex problems
-
----
-
-## Rollback Procedure
-
-### If Critical Issue Found
-1. **Disable auto-update** (already disabled by default)
-2. **Publish hotfix** with incremented patch version
-3. **Communicate** via release notes and GitHub
-4. **Provide manual uninstall instructions** if needed
-
-### Data Migration
-- Database migrations are forward-only
-- Downgrade requires backup restore
-- Document in release notes
+Publish a concise report of fixes and migrations, exact commands and pass/fail results, current artifacts and signatures, completed manual cases, and unresolved prerequisites. A missing user-owned production signing certificate can block a signed release; record the exact signing preflight failure without exposing certificate material. Unexecuted lifecycle or soak cases remain incomplete verification and must not be relabeled as external blockers or successful results.

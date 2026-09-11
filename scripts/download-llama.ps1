@@ -2,13 +2,17 @@
 <# Download the official llama.cpp Windows x64 CPU runtime. #>
 
 param(
-    [string]$Version = "latest",
+    [string]$Version,
     [string]$OutputDir = "runtimes\llama"
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$OutputPath = Join-Path $ProjectRoot $OutputDir
+$OutputPath = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $OutputDir))
+if ($OutputPath -ne (Join-Path $ProjectRoot 'runtimes\llama')) { throw 'Runtime output must be the dedicated runtimes/llama directory.' }
+$RuntimeLock = Get-Content -LiteralPath (Join-Path $ProjectRoot 'resources\runtime-lock.json') -Raw | ConvertFrom-Json
+if ($Version -and $Version -ne $RuntimeLock.llama.version) { throw 'Runtime version must match resources/runtime-lock.json.' }
+$Version = $RuntimeLock.llama.version
 $ApiHeaders = @{ "User-Agent" = "NOC-AI-build" }
 
 if ($Version -eq "latest") {
@@ -40,6 +44,9 @@ $Archive = Join-Path $TempDir $AssetName
 try {
     Write-Host "Downloading official llama.cpp $($Release.tag_name)..." -ForegroundColor Cyan
     Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $Archive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -ne $RuntimeLock.llama.sha256) {
+        throw 'llama.cpp archive checksum differs from the pinned runtime lock.'
+    }
     Expand-Archive -LiteralPath $Archive -DestinationPath $TempDir -Force
     foreach ($File in $RequiredFiles) {
         $Source = Get-ChildItem -LiteralPath $TempDir -Recurse -File -Filter $File | Select-Object -First 1

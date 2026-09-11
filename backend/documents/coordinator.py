@@ -46,14 +46,33 @@ class IngestionCoordinator:
         self.settings = settings
         self.session_factory = session_factory
         self.model_manager = model_manager
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self._queued_ids: set[str] = set()
+        self.mutation_lock = asyncio.Lock()
         self.worker: asyncio.Task | None = None
         self.stopping = False
         self.vector_store = VectorStore(settings.database_url, embedding_dim=384)
 
     async def start(self) -> None:
+        if self.worker and not self.worker.done():
+            return
         self.stopping = False
+        self.vector_store._get_conn()
         with self.session_factory() as db:
+            # Repair older installations and crashes between file staging and
+            # enqueueing. The source remains authoritative and recoverable.
+            orphaned = db.query(Document).filter(
+                Document.status.in_(["queued", "parsing", "chunking", "embedding", "indexing"]),
+                ~Document.id.in_(db.query(IngestionJob.document_id).filter(
+                    IngestionJob.status.in_(["pending", "running"])
+                )),
+            ).all()
+            for document in orphaned:
+                db.add(IngestionJob(id=str(uuid.uuid4()), document_id=document.id,
+                                    collection_id=document.collection_id, status="pending",
+                                    priority=4, current_stage="queued", progress=0))
+                document.status = "queued"
+            db.flush()
             interrupted = db.query(IngestionJob).filter(
                 IngestionJob.status.in_(["pending", "running"])
             ).all()
@@ -62,7 +81,10 @@ class IngestionCoordinator:
                 job.current_stage = "queued"
                 job.error_message = None
                 job.started_at = None
-                await self.queue.put(job.id)
+                document = db.get(Document, job.document_id)
+                if document:
+                    document.status = "queued"
+                await self.enqueue(job.id)
             db.commit()
         self.worker = asyncio.create_task(self._run(), name="document-ingestion-worker")
 
@@ -78,7 +100,11 @@ class IngestionCoordinator:
         self.vector_store.close()
 
     async def enqueue(self, job_id: str) -> None:
-        await self.queue.put(job_id)
+        # The DB is the durable backlog; the bounded queue is only a wakeup
+        # cache, so backpressure never leaves requests waiting on a full queue.
+        if job_id not in self._queued_ids and not self.queue.full():
+            self.queue.put_nowait(job_id)
+            self._queued_ids.add(job_id)
 
     async def enqueue_document(self, document_id: str, priority: int = 4) -> str:
         with self.session_factory() as db:
@@ -111,7 +137,18 @@ class IngestionCoordinator:
 
     async def _run(self) -> None:
         while not self.stopping:
-            job_id = await self.queue.get()
+            if self.queue.empty():
+                with self.session_factory() as db:
+                    pending = db.query(IngestionJob.id).filter_by(status="pending").order_by(
+                        IngestionJob.priority, IngestionJob.created_at
+                    ).limit(256).all()
+                for (pending_id,) in pending:
+                    await self.enqueue(pending_id)
+            try:
+                job_id = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            self._queued_ids.discard(job_id)
             try:
                 await self._process(job_id)
             except asyncio.CancelledError:
@@ -122,9 +159,13 @@ class IngestionCoordinator:
                 self.queue.task_done()
 
     async def _process(self, job_id: str) -> None:
+        async with self.mutation_lock:
+            await self._process_locked(job_id)
+
+    async def _process_locked(self, job_id: str) -> None:
         with self.session_factory() as db:
             job = db.get(IngestionJob, job_id)
-            if job is None or job.status == "cancelled":
+            if job is None or job.status != "pending":
                 return
             document = db.get(Document, job.document_id)
             collection = db.get(Collection, job.collection_id)
@@ -221,7 +262,7 @@ class IngestionCoordinator:
                         if staged_vector_ids:
                             await self.vector_store.delete_chunks(staged_vector_ids)
                             _delete_chunk_rows(db, staged_vector_ids)
-                        document.status = "failed"
+                        document.status = "cancelled"
                         document.error_message = "Ingestion cancelled"
                         job.current_stage = "cancelled"
                         job.completed_at = datetime.utcnow()
@@ -300,6 +341,18 @@ class IngestionCoordinator:
                         await self.vector_store.delete_chunks(old_ids)
                     except Exception:
                         logger.exception("Could not remove superseded vectors for document %s", document.id)
+            except asyncio.CancelledError:
+                db.rollback()
+                job = db.get(IngestionJob, job_id)
+                if job and job.status == "running":
+                    job.status = "pending"
+                    job.current_stage = "queued"
+                    job.error_message = "Interrupted by application shutdown; queued for restart"
+                    document = db.get(Document, job.document_id)
+                    if document:
+                        document.status = "queued"
+                    db.commit()
+                raise
             except Exception as exc:
                 db.rollback()
                 if staged_vector_ids and not replacement_committed:

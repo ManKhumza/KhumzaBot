@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuthStore } from '@/stores/authStore';
 import { nocaiAPI } from '@/utils/api';
+import { userFacingError } from '@/utils/errors';
 import { Button } from '@/components/common/Button';
 import { Input } from '@/components/common/Input';
 import { Textarea } from '@/components/common/Textarea';
@@ -133,7 +134,7 @@ export const Knowledge = () => {
     try {
       addUploadFiles(await nocaiAPI.knowledge.selectDocuments());
     } catch (browseError) {
-      setUploadError(browseError instanceof Error ? browseError.message : 'Could not open the document picker.');
+      setUploadError(userFacingError(browseError, 'Could not open the document picker.'));
     }
   };
 
@@ -159,8 +160,9 @@ export const Knowledge = () => {
       setUploadFiles([]);
       await handleSelectCollection(selectedCollection);
     } catch (error) {
-      console.error('Failed to upload:', error);
-      setUploadError(error instanceof Error ? error.message : 'Could not queue the selected documents.');
+      const message = userFacingError(error, 'Could not queue the selected documents.');
+      console.error('Failed to upload:', message);
+      setUploadError(message);
     } finally {
       setUploading(false);
     }
@@ -178,8 +180,9 @@ export const Knowledge = () => {
 
   const handleDeleteDoc = async (docId: string) => {
     try {
-      await nocaiAPI.knowledge.deleteDocument(docId);
+      const result = await nocaiAPI.knowledge.deleteDocument(docId);
       await handleSelectCollection(selectedCollection!);
+      if (result.warning) setError(result.warning);
     } catch (error) {
       console.error('Failed to delete document:', error);
       setError(error instanceof Error ? error.message : 'Could not delete the document.');
@@ -191,11 +194,13 @@ export const Knowledge = () => {
 
   const handleDeleteCollection = async (collectionId: string) => {
     try {
-      await nocaiAPI.knowledge.deleteCollection(collectionId);
+      const result = await nocaiAPI.knowledge.deleteCollection(collectionId);
       setCollections(prev => prev.filter(c => c.id !== collectionId));
       if (selectedCollection?.id === collectionId) {
         setSelectedCollection(null);
+        setDocuments([]);
       }
+      if (result.warning) setError(result.warning);
     } catch (error) {
       console.error('Failed to delete collection:', error);
       setError(error instanceof Error ? error.message : 'Could not delete the collection.');
@@ -308,6 +313,18 @@ export const Knowledge = () => {
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
+                  {(selectedCollection.permission === 'admin' || selectedCollection.ownerId === user?.id) && (
+                    <Button
+                      variant="destructive"
+                      onClick={() => {
+                        setDeletingCollectionId(selectedCollection.id);
+                        setShowDeleteCollectionConfirm(true);
+                      }}
+                    >
+                      <Trash2 className="w-4 h-4 mr-2" />
+                      Delete Source
+                    </Button>
+                  )}
                   <Button variant="outline" onClick={() => { setUploadError(null); setShowUploadDialog(true); }} disabled={!selectedCollection}>
                     <Upload className="w-4 h-4 mr-2" />
                     Upload Documents
@@ -376,8 +393,9 @@ export const Knowledge = () => {
                                       <RefreshCw className="w-4 h-4" />
                                     </Button>
                                   )}
-                                  <Button variant="ghost" size="sm" onClick={() => { setDeletingDocId(doc.id); setShowDeleteDocConfirm(true); }} aria-label={`Delete ${doc.originalFilename}`} title="Delete document">
-                                    <Trash2 className="w-4 h-4" />
+                                  <Button variant="outline" size="sm" className="text-destructive" onClick={() => { setDeletingDocId(doc.id); setShowDeleteDocConfirm(true); }} aria-label={`Delete ${doc.originalFilename}`} title="Delete document">
+                                    <Trash2 className="mr-1.5 w-4 h-4" />
+                                    Delete
                                   </Button>
                                 </div>
                               </td>
@@ -521,9 +539,9 @@ export const Knowledge = () => {
       <AlertDialog
         open={showDeleteCollectionConfirm}
         onOpenChange={setShowDeleteCollectionConfirm}
-        title="Delete Collection"
-        description="Are you sure you want to delete this collection? All documents and embeddings will be permanently removed."
-        confirmText="Delete"
+        title="Delete Knowledge Source"
+        description={`Delete ${selectedCollection?.name || 'this source'}? Its documents, indexed chunks, citations, and stored source files will be permanently removed.`}
+        confirmText="Delete Source"
         cancelText="Cancel"
         onConfirm={() => deletingCollectionId && handleDeleteCollection(deletingCollectionId)}
         variant="destructive"

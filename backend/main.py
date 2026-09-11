@@ -32,7 +32,9 @@ from backend.health.routes import router as health_router
 from backend.api.routes import router as api_router
 from backend.retrieval.routes import router as retrieval_router
 from backend.jobs.routes import router as jobs_router
+from backend.system.routes import router as system_router
 from backend.config import Settings, get_settings
+from backend.version import __version__
 from backend.db.database import init_db, close_db, get_session_factory
 from backend.db.models import Model
 from backend.db.migrations import run_migrations
@@ -131,8 +133,12 @@ async def lifespan(app: FastAPI):
     
     # Ensure directories exist
     settings.ensure_directories()
+    from backend.system.diagnostics import open_diagnostics, close_diagnostics
+    diagnostics_handler = open_diagnostics(settings.logs_dir)
     
     # Initialize database
+    from backend.system.backup import apply_pending_restore
+    apply_pending_restore(settings)
     engine = await init_db(settings.database_url, data_dir=settings.data_dir)
     
     # Run migrations
@@ -151,27 +157,46 @@ async def lifespan(app: FastAPI):
     app.state.engine = engine
     app.state.session_token = session_token
     app.state.model_manager = ModelLifecycleManager(settings)
+    app.state.stopping = False
+    app.state.maintenance = False
     SessionLocal = get_session_factory(engine)
     await app.state.model_manager.startup(SessionLocal)
     app.state.ingestion = IngestionCoordinator(settings, SessionLocal, app.state.model_manager)
     await app.state.ingestion.start()
+    if os.getenv("NOC_AI_PARENT_PIPE") == "1":
+        from backend.system.parent_watchdog import start_parent_watchdog
+        async def parent_exited():
+            logger.warning("Electron owner exited; shutting down owned backend services")
+            app.state.stopping = True
+            server = getattr(app.state, "uvicorn_server", None)
+            if server:
+                server.should_exit = True
+            await app.state.ingestion.stop()
+            await app.state.model_manager.shutdown()
+        app.state.parent_watchdog = start_parent_watchdog(asyncio.get_running_loop(), parent_exited)
     
     logger.info("Backend startup complete")
     
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down backend...")
-    await app.state.ingestion.stop()
-    await app.state.model_manager.shutdown()
-    await close_db(engine)
-    logger.info("Backend shutdown complete")
+    try:
+        yield
+    finally:
+        app.state.stopping = True
+        logger.info("Shutting down backend...")
+        try:
+            await app.state.ingestion.stop()
+        finally:
+            try:
+                await app.state.model_manager.shutdown()
+            finally:
+                await close_db(engine)
+                close_diagnostics(diagnostics_handler)
+        logger.info("Backend shutdown complete")
 
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title="NOC AI Assistant API",
-        version="1.0.3",
+        version=__version__,
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -180,6 +205,7 @@ def create_app() -> FastAPI:
     @app.post("/internal/prepare-shutdown")
     async def prepare_shutdown(request: Request):
         """Stop owned workers before Electron terminates Python on Windows."""
+        request.app.state.stopping = True
         await request.app.state.ingestion.stop()
         await request.app.state.model_manager.shutdown()
         return {"success": True}
@@ -198,6 +224,11 @@ def create_app() -> FastAPI:
             supplied_transport_token, expected_transport_token
         ):
             return JSONResponse({"detail": "Backend transport authentication failed"}, status_code=401)
+
+        if getattr(request.app.state, "maintenance", False) and not (
+            request.url.path.startswith("/health") or request.url.path == "/internal/prepare-shutdown"
+        ):
+            return JSONResponse({"detail": "Application maintenance in progress; try again shortly"}, status_code=503)
 
         if request.url.path in [
             "/health", "/health/ready", "/health/live",
@@ -228,6 +259,7 @@ def create_app() -> FastAPI:
     app.include_router(api_router, prefix="/api/v1", tags=["api"])
     app.include_router(retrieval_router, prefix="/api/v1/retrieval", tags=["retrieval"])
     app.include_router(jobs_router, prefix="/api/v1/jobs", tags=["jobs"])
+    app.include_router(system_router, prefix="/api/v1")
     
     return app
 
@@ -255,7 +287,7 @@ def main():
     app = create_app()
     
     # Run with uvicorn
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=args.host,
         port=args.port,
@@ -264,6 +296,9 @@ def main():
         server_header=False,
         date_header=False,
     )
+    server = uvicorn.Server(config)
+    app.state.uvicorn_server = server
+    server.run()
 
 
 if __name__ == "__main__":

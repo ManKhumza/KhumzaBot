@@ -1,11 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '@/stores/authStore';
 import { nocaiAPI } from '@/utils/api';
 import { Button } from '@/components/common/Button';
 import { Input } from '@/components/common/Input';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/common/Card';
 import { Activity, AlertCircle, Lock, User } from 'lucide-react';
+import { userFacingError, withTimeout } from '@/utils/errors';
 
 export const Login = () => {
   const navigate = useNavigate();
@@ -16,29 +17,30 @@ export const Login = () => {
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [version, setVersion] = useState<string | null>(null);
+
+  const loadStatus = useCallback(async () => {
+    setStatusError(null);
+    try {
+      const status = await withTimeout(nocaiAPI.auth.getStatus(), 'Local services are taking too long to start. Retry or open diagnostics.');
+      setNeedsSetup(status.needsSetup);
+    } catch (failure) {
+      setStatusError(userFacingError(failure, 'Local services are unavailable. Retry or open diagnostics.'));
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const loadStatus = async () => {
-      try {
-        const status = await nocaiAPI.auth.getStatus();
-        if (!cancelled) setNeedsSetup(status.needsSetup);
-      } catch {
-        // Electron emits a ready event once the private backend is available.
-      }
-    };
-
-    loadStatus();
+    void loadStatus();
+    void nocaiAPI.system.getVersion().then(setVersion).catch(() => setVersion(null));
     const unsubscribe = window.nocai?.onBackendStatusChange((status) => {
       if (status.status === 'ready') loadStatus();
     });
 
     return () => {
-      cancelled = true;
       unsubscribe?.();
     };
-  }, []);
+  }, [loadStatus]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -61,7 +63,7 @@ export const Login = () => {
       await login(username, password);
       navigate('/');
     } catch (err: any) {
-      setError(err.message || 'Invalid username or password');
+      setError(userFacingError(err, 'Invalid username or password'));
     } finally {
       setIsLoading(false);
     }
@@ -70,14 +72,14 @@ export const Login = () => {
   const displayError = error || authError;
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10">
+    <div className="flex min-h-full items-center justify-center bg-background px-4 py-10">
       <Card className="w-full max-w-md shadow-none">
         <CardHeader className="text-center">
           <div className="mx-auto mb-4 flex items-center justify-center w-12 h-12 rounded-lg bg-primary text-primary-foreground">
             <Activity className="w-7 h-7" />
           </div>
           <CardTitle className="text-2xl">
-            {needsSetup === null ? 'Starting local services' : needsSetup ? 'Create your administrator' : 'NOC AI Assistant'}
+            {needsSetup === null ? statusError ? 'Local services unavailable' : 'Starting local services' : needsSetup ? 'Create your administrator' : 'NOC AI Assistant'}
           </CardTitle>
           <CardDescription>
             {needsSetup === null
@@ -88,6 +90,7 @@ export const Login = () => {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          {statusError && <div className="mb-4 space-y-3 rounded-md border border-destructive/30 p-3"><p role="alert" className="text-sm text-destructive">{statusError}</p><Button variant="outline" onClick={() => void loadStatus()}>Retry connection</Button></div>}
           <form onSubmit={handleSubmit} className="space-y-4">
             {displayError && (
               <div className="flex items-center gap-2 p-3 rounded-lg bg-destructive/10 text-destructive text-sm" role="alert">
@@ -145,7 +148,7 @@ export const Login = () => {
               </div>
             )}
 
-            <Button type="submit" className="w-full" size="lg" isLoading={isLoading || needsSetup === null}>
+            <Button type="submit" className="w-full" size="lg" isLoading={isLoading || (needsSetup === null && !statusError)} disabled={needsSetup === null}>
               {needsSetup === null
                 ? 'Preparing...'
                 : isLoading
@@ -158,9 +161,8 @@ export const Login = () => {
           <p className="text-sm text-muted-foreground">
             Offline by default. Your chats and documents stay on this machine.
           </p>
-          <p className="text-xs text-muted-foreground">
-            Version 1.0.2
-          </p>
+          <Link className="text-sm text-primary underline" to="/diagnostics">Open diagnostics</Link>
+          {version && <p className="text-xs text-muted-foreground">Version {version}</p>}
         </CardFooter>
       </Card>
     </div>

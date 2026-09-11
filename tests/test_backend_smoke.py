@@ -27,7 +27,11 @@ def test_bootstrap_login_and_protected_model_endpoints(tmp_path, monkeypatch):
     with TestClient(create_app()) as client:
         transport_headers = {"X-NOC-AI-Backend-Token": "test-transport-secret"}
         assert client.get("/health/ready").status_code == 401
-        assert client.get("/health/ready", headers=transport_headers).json()["status"] == "ready"
+        readiness = client.get("/health/ready", headers=transport_headers)
+        assert readiness.status_code == 200
+        assert readiness.json()["ready"] is True
+        assert readiness.json()["components"]["database"]["status"] == "healthy"
+        assert readiness.json()["components"]["vectorStore"]["dimension"] == 384
         assert client.get("/api/v1/models").status_code == 401
         assert client.get("/api/v1/auth/status", headers=transport_headers).json() == {"needsSetup": True}
 

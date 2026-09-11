@@ -12,6 +12,8 @@ export const IPC = {
   KNOWLEDGE_REPROCESS: 'nocai:knowledge:reprocessDocument',
   SYSTEM_VERSION: 'nocai:system:getVersion',
   SYSTEM_SHUTDOWN: 'nocai:system:shutdown',
+  SYSTEM_DIAGNOSTICS: 'nocai:system:getDiagnostics',
+  SYSTEM_EXPORT_DIAGNOSTICS: 'nocai:system:exportDiagnostics',
 } as const;
 
 export interface ChatSendPayload {
@@ -53,4 +55,6 @@ export type IpcInvokeMap = {
   [IPC.KNOWLEDGE_REPROCESS]: (payload: ReprocessPayload) => Promise<unknown>;
   [IPC.SYSTEM_VERSION]: () => Promise<string>;
   [IPC.SYSTEM_SHUTDOWN]: () => Promise<void>;
+  [IPC.SYSTEM_DIAGNOSTICS]: () => Promise<unknown>;
+  [IPC.SYSTEM_EXPORT_DIAGNOSTICS]: () => Promise<{ path: string | null }>;
 };

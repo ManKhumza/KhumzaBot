@@ -14,6 +14,8 @@ SENSITIVE_FIELDS = {
 }
 
 def sanitize_metadata(data: dict) -> dict:
+    if isinstance(data, list):
+        return [sanitize_metadata(value) for value in data]
     if not isinstance(data, dict):
         return data
     return {
@@ -55,7 +57,7 @@ def audit_log(
         db.add(entry)
         db.commit()
     except Exception as e:
-        logger.error(f"Audit log failed: {e}")
+        logger.error("Audit write failed for action %s (%s)", action, type(e).__name__)
         db.rollback()
     finally:
         if should_close:

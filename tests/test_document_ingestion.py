@@ -97,6 +97,139 @@ def test_document_ingestion_queue_status(tmp_path, monkeypatch):
     create_db_engine.cache_clear()
 
 
+def test_delete_knowledge_source_removes_database_vectors_files_and_chat_reference(tmp_path, monkeypatch):
+    """Knowledge deletion: a visible source deletion is complete across every local store."""
+    data_dir = tmp_path / "data"
+    knowledge_dir = data_dir / "knowledge"
+    monkeypatch.setenv("NOC_AI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("NOC_AI_MODELS_DIR", str(data_dir / "models"))
+    monkeypatch.setenv("NOC_AI_KNOWLEDGE_DIR", str(knowledge_dir))
+    monkeypatch.setenv("NOC_AI_LOGS_DIR", str(data_dir / "logs"))
+    monkeypatch.setenv("NOC_AI_DATABASE_URL", f"sqlite:///{data_dir / 'test.db'}")
+    monkeypatch.setenv("NOC_AI_SESSION_TOKEN", "test-transport-secret")
+
+    from backend.config import get_settings
+    from backend.db.database import create_db_engine, get_session_factory
+    from backend.db.models import Chunk, Collection, Conversation, Document, IngestionJob, Model
+    from backend.main import create_app
+    from backend.retrieval.vector_store import ChunkWithEmbedding
+
+    get_settings.cache_clear()
+    create_db_engine.cache_clear()
+
+    with TestClient(create_app()) as client:
+        transport_headers = {"X-NOC-AI-Backend-Token": "test-transport-secret"}
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "ChangeMe-12345!"},
+            headers=transport_headers,
+        )
+        headers = {**transport_headers, "Authorization": f"Bearer {login.json()['token']}"}
+        user_id = login.json()["user"]["id"]
+        SessionLocal = get_session_factory(client.app.state.engine)
+
+        with SessionLocal() as db:
+            db.add(Model(
+                id="embedding-delete", name="Embedding", filename="embedding.gguf",
+                filepath="embedding.gguf", size_bytes=1, role="embedding", status="active",
+            ))
+            db.commit()
+
+        created = client.post(
+            "/api/v1/knowledge/collections",
+            headers=headers,
+            json={
+                "name": "Obsolete Runbooks",
+                "embeddingModelId": "embedding-delete",
+                "embeddingConfig": {},
+                "chunkingConfig": {},
+            },
+        )
+        assert created.status_code == 200, created.text
+        collection_id = created.json()["id"]
+        source_root = knowledge_dir / "collections" / collection_id
+        source_file = source_root / "source" / "obsolete.txt"
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        source_file.write_text("obsolete source content", encoding="utf-8")
+        individual_file = source_root / "source" / "remove-one.txt"
+        individual_file.write_text("remove this document", encoding="utf-8")
+
+        with SessionLocal() as db:
+            document = Document(
+                id="delete-document", collection_id=collection_id, filename=source_file.name,
+                original_filename=source_file.name, filepath=str(source_file.relative_to(knowledge_dir)),
+                mime_type="text/plain", size_bytes=source_file.stat().st_size,
+                file_hash="delete-hash", uploaded_by=user_id, status="ready", chunk_count=1,
+            )
+            chunk = Chunk(
+                id="delete-chunk", document_id=document.id, collection_id=collection_id,
+                chunk_index=0, content="obsolete source content", page_start=1, page_end=1,
+            )
+            individual_document = Document(
+                id="single-document", collection_id=collection_id, filename=individual_file.name,
+                original_filename=individual_file.name, filepath=str(individual_file.relative_to(knowledge_dir)),
+                mime_type="text/plain", size_bytes=individual_file.stat().st_size,
+                file_hash="single-hash", uploaded_by=user_id, status="ready", chunk_count=1,
+            )
+            individual_chunk = Chunk(
+                id="single-chunk", document_id=individual_document.id, collection_id=collection_id,
+                chunk_index=0, content="remove this document", page_start=1, page_end=1,
+            )
+            db.add_all([
+                document,
+                chunk,
+                individual_document,
+                individual_chunk,
+                IngestionJob(
+                    id="delete-job", document_id=document.id, collection_id=collection_id,
+                    status="completed", current_stage="ready", progress=100,
+                ),
+                Conversation(
+                    id="delete-conversation", user_id=user_id, title="Old source chat",
+                    collection_id=collection_id,
+                ),
+            ])
+            db.commit()
+
+        store = client.app.state.ingestion.vector_store
+        asyncio.run(store.add_chunks([
+            ChunkWithEmbedding(chunk=chunk, embedding=[1.0] + [0.0] * 383),
+            ChunkWithEmbedding(chunk=individual_chunk, embedding=[1.0] + [0.0] * 383),
+        ]))
+        assert store._get_conn().execute(
+            "SELECT count(*) FROM chunks_vec WHERE collection_id = ?", (collection_id,)
+        ).fetchone()[0] == 2
+
+        deleted_document = client.delete("/api/v1/knowledge/documents/single-document", headers=headers)
+        assert deleted_document.status_code == 200, deleted_document.text
+        assert deleted_document.json() == {"success": True, "warning": None}
+        assert not individual_file.exists()
+        assert store._get_conn().execute(
+            "SELECT count(*) FROM chunks_vec WHERE chunk_id = 'single-chunk'"
+        ).fetchone()[0] == 0
+        with SessionLocal() as db:
+            assert db.get(Document, "single-document") is None
+            assert db.get(Chunk, "single-chunk") is None
+
+        deleted = client.delete(f"/api/v1/knowledge/collections/{collection_id}", headers=headers)
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"success": True, "warning": None}
+        assert not source_root.exists()
+        assert store._get_conn().execute(
+            "SELECT count(*) FROM chunks_vec WHERE collection_id = ?", (collection_id,)
+        ).fetchone()[0] == 0
+
+        with SessionLocal() as db:
+            assert db.get(Collection, collection_id) is None
+            assert db.get(Document, "delete-document") is None
+            assert db.get(Chunk, "delete-chunk") is None
+            assert db.get(IngestionJob, "delete-job") is None
+            assert db.get(Conversation, "delete-conversation").collection_id is None
+
+    get_settings.cache_clear()
+    create_db_engine.cache_clear()
+
+
 def test_document_ingestion_parsing_chunking_embedding_indexing_stages(tmp_path):
     """Document ingestion: pipeline goes through parsing, chunking, embedding, indexing stages."""
     from backend.documents.pipeline import DocumentStatus, IngestionProgress

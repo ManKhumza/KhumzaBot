@@ -5,7 +5,7 @@ NOC AI Assistant is a local Windows desktop application built with Electron, Rea
 ## Requirements
 
 - Windows 10 or 11 x64
-- Node.js 20 or newer
+- Node.js 22.12.0 or newer
 - Python 3.11 or newer
 - PowerShell 7 is recommended
 

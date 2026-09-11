@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { AlertTriangle, Home, RefreshCw } from 'lucide-react';
+import { userFacingError } from '@/utils/errors';
 
 interface AppErrorBoundaryProps {
   children: ReactNode;
@@ -19,7 +20,7 @@ export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorB
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('Renderer boundary caught an error', error, info.componentStack);
+    console.error('Renderer view failed:', userFacingError(error));
   }
 
   componentDidUpdate(previousProps: AppErrorBoundaryProps) {
@@ -47,12 +48,13 @@ export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorB
           </div>
           <h1 className="mt-4 text-lg font-semibold">This view could not be displayed</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Your local data is safe. Reload this view or return to the operations overview.
+            Reload this view or open diagnostics to check the local services.
           </p>
           <code className="mt-4 block max-h-24 overflow-auto bg-muted p-3 text-left text-xs text-muted-foreground">
-            {error.message || 'Unknown renderer error'}
+            {userFacingError(error, 'Unknown renderer error')}
           </code>
           <div className="mt-5 flex flex-wrap justify-center gap-2">
+            <button type="button" onClick={() => { this.setState({ error: null }); window.location.hash = '#/diagnostics'; }} className="rounded-md border border-input px-4 py-2 text-sm">Diagnostics</button>
             <button
               type="button"
               onClick={this.returnHome}

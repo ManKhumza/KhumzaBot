@@ -204,8 +204,31 @@ def test_generation_cancellation_endpoint_exists(tmp_path, monkeypatch):
 
 def test_cancellation_through_all_layers(tmp_path):
     """Cancellation: generation cancellation flows through all layers."""
-    from backend.inference.lifecycle import ModelLifecycleManager
-    
-    # Test that generation_context exists for cancellation tracking
-    assert hasattr(ModelLifecycleManager, 'generation_context')
-    assert hasattr(ModelLifecycleManager, 'wait_for_idle')
+    import asyncio
+    import pytest
+    from fastapi import HTTPException
+    from backend.chat.generation import GenerationRegistry
+    async def scenario():
+        registry = GenerationRegistry(limit=1)
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def response():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+                registry.finish("conversation")
+        ticket = registry.begin("conversation", "owner")
+        ticket.task = asyncio.create_task(response())
+        await started.wait()
+        with pytest.raises(HTTPException) as forbidden:
+            registry.stop("conversation", "different-user")
+        assert forbidden.value.status_code == 404
+        assert not ticket.task.done()
+        assert registry.stop("conversation", "owner") is True
+        with pytest.raises(asyncio.CancelledError):
+            await ticket.task
+        assert closed.is_set()
+        assert not registry.active
+        assert registry.stop("conversation", "owner") is False
+    asyncio.run(scenario())

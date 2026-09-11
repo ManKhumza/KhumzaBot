@@ -33,6 +33,7 @@ const navigation = [
   { name: 'Knowledge', href: '/knowledge', icon: Database },
   { name: 'Search', href: '/search', icon: Search },
   { name: 'Settings', href: '/settings', icon: Settings },
+  { name: 'Diagnostics', href: '/diagnostics', icon: Activity },
 ];
 
 const adminNavigation = [
@@ -66,6 +67,7 @@ export const Layout = () => {
   const [knowledgeLabel, setKnowledgeLabel] = useState('Checking knowledge');
 
   const refreshWorkspaceStatus = useCallback(async () => {
+    if (!user || user.mustChangePassword) return;
     const [healthResult, modelsResult, collectionsResult] = await Promise.allSettled([
       nocaiAPI.system.getHealth(),
       nocaiAPI.models.listModels('chat'),
@@ -89,7 +91,7 @@ export const Layout = () => {
     } else {
       setKnowledgeLabel('Knowledge unavailable');
     }
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     refreshWorkspaceStatus();
@@ -99,6 +101,7 @@ export const Layout = () => {
 
   useEffect(() => {
     const loadDefaults = async () => {
+      if (!user || user.mustChangePassword) return;
       try {
         const settings = await nocaiAPI.settings.get();
         setSidebarCollapsed(Boolean(settings.appearance.sidebarCollapsed));
@@ -107,7 +110,7 @@ export const Layout = () => {
       }
     };
     loadDefaults();
-  }, []);
+  }, [user]);
 
   const handleLogout = async () => {
     await logout();
@@ -137,7 +140,7 @@ export const Layout = () => {
   );
 
   return (
-    <div className="min-h-screen bg-background font-sans antialiased">
+    <div className="h-full bg-background font-sans antialiased">
       {mobileSidebarOpen && (
         <button
           className="fixed inset-0 z-40 bg-black/45 lg:hidden"
@@ -148,7 +151,7 @@ export const Layout = () => {
 
       <aside
         className={clsx(
-          'fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-border bg-card transition-[transform,width] duration-200',
+          'absolute inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-border bg-card transition-[transform,width] duration-200',
           mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
           sidebarCollapsed ? 'lg:w-16' : 'lg:w-64'
         )}
@@ -170,7 +173,7 @@ export const Layout = () => {
           )}
         </div>
 
-        <div className="border-b border-border p-3">
+        {user && !user.mustChangePassword && <div className="border-b border-border p-3">
           <button
             onClick={() => {
               navigate('/chats/new');
@@ -185,11 +188,11 @@ export const Layout = () => {
             <Plus className="h-4 w-4 flex-none" />
             {showLabels && <span>New chat</span>}
           </button>
-        </div>
+        </div>}
 
         <nav className="flex-1 overflow-y-auto p-2">
           <ul className="space-y-1">
-            {navigation.map((item) => (
+            {navigation.filter((item) => user ? !user.mustChangePassword || ['/settings', '/diagnostics'].includes(item.href) : item.href === '/diagnostics').map((item) => (
               <li key={item.name}>
                 <NavLink
                   to={item.href}
@@ -205,7 +208,7 @@ export const Layout = () => {
             ))}
           </ul>
 
-          {user?.roles.includes('administrator') && (
+          {!user?.mustChangePassword && user?.roles.includes('administrator') && (
             <div className="mt-5 border-t border-border pt-4">
               {showLabels && (
                 <p className="mb-2 px-3 text-xs font-semibold uppercase text-muted-foreground">Administration</p>
@@ -230,6 +233,7 @@ export const Layout = () => {
         </nav>
 
         <div className="space-y-1 border-t border-border p-2">
+          {!user && <NavLink to="/login" className={navLinkClass}>Sign in</NavLink>}
           <button
             onClick={toggleTheme}
             className={clsx(
@@ -291,7 +295,7 @@ export const Layout = () => {
 
       <main
         className={clsx(
-          'flex h-screen min-w-0 flex-col transition-[margin] duration-200',
+          'flex h-full min-h-0 min-w-0 flex-col transition-[margin] duration-200',
           sidebarCollapsed ? 'lg:ml-16' : 'lg:ml-64'
         )}
       >
@@ -331,7 +335,7 @@ export const Layout = () => {
         </header>
 
         <div className={clsx(
-          'flex-1',
+          'min-h-0 flex-1',
           isConversation ? 'overflow-hidden' : 'overflow-auto p-4 md:p-6'
         )}>
           <AppErrorBoundary resetKey={location.pathname} variant="page">

@@ -68,11 +68,11 @@ declare global {
       knowledge: {
         listCollections: () => Promise<Collection[]>;
         createCollection: (req: CreateCollectionRequest) => Promise<Collection>;
-        deleteCollection: (id: string) => Promise<void>;
+        deleteCollection: (id: string) => Promise<{ success: boolean; warning?: string | null }>;
         selectDocuments: () => Promise<SelectedDocumentFile[]>;
         uploadDocuments: (collectionId: string, filePaths: string[]) => Promise<Document[]>;
         listDocuments: (collectionId: string) => Promise<Document[]>;
-        deleteDocument: (id: string) => Promise<void>;
+        deleteDocument: (id: string) => Promise<{ success: boolean; warning?: string | null }>;
         reprocessDocument: (id: string) => Promise<void>;
         search: (req: SearchRequest) => Promise<SearchResult[]>;
       };
@@ -95,7 +95,9 @@ declare global {
       };
       // System
       system: {
-        getHealth: () => Promise<{ status: string; service: string }>;
+        getDiagnostics: () => Promise<LocalDiagnostics>;
+        exportDiagnostics: () => Promise<{ path: string | null }>;
+        getHealth: () => Promise<{ status: string; service: string; ready?: boolean; components?: Record<string, {status: string; dimension?: number; detail?: string}> }>;
         getVersion: () => Promise<string>;
         getDataPaths: () => Promise<DataPaths>;
         createBackup: (options: BackupOptions) => Promise<BackupResult>;
@@ -218,9 +220,16 @@ interface DataPaths {
 }
 
 interface BackendStatusEvent {
-  status: 'starting' | 'ready' | 'error' | 'stopped';
+  status: 'starting' | 'ready' | 'error' | 'stopped' | 'degraded' | 'backing_off' | 'failed' | 'stopping';
   port?: number;
   error?: string;
+}
+
+export interface LocalDiagnostics {
+  version: string;
+  backend: { state: string; lastError?: string | null; restartAttempts?: number };
+  paths: { logs: string; appData?: string };
+  recentErrors: Array<{ timestamp: string; component?: string; event?: string; message: string; correlationId?: string }>;
 }
 
 interface AppReadyEvent {
@@ -245,20 +254,22 @@ class NocAIAPI {
   async ensureReady(): Promise<void> {
     if (this.ready) return;
     if (!this.initPromise) {
-      this.initPromise = this.initialize();
+      this.initPromise = this.initialize().catch((error) => {
+        this.initPromise = null;
+        throw error;
+      });
     }
     await this.initPromise;
   }
 
   private async initialize(): Promise<void> {
-    // Wait for preload to be ready
-    await new Promise<void>((resolve) => {
-      if (window.nocai) {
-        resolve();
-      } else {
-        window.addEventListener('nocai:ready', () => resolve(), { once: true });
-      }
-    });
+    // Electron executes the preload before renderer scripts. If the bridge is
+    // absent, waiting for an event that can never be emitted leaves the whole UI
+    // on "Checking authentication" forever. Fail promptly so the in-app error
+    // state remains usable and offers a retry/restart path.
+    if (!window.nocai) {
+      throw new Error('Desktop integration failed to load. Restart NOC AI Assistant.');
+    }
     this.ready = true;
   }
 
@@ -461,6 +472,14 @@ class NocAIAPI {
 
     // System
     system = {
+      getDiagnostics: async () => {
+        await this.ensureReady();
+        return window.nocai.system.getDiagnostics();
+      },
+      exportDiagnostics: async () => {
+        await this.ensureReady();
+        return window.nocai.system.exportDiagnostics();
+      },
       getHealth: async () => {
         await this.ensureReady();
         return window.nocai.system.getHealth();

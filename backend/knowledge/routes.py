@@ -12,11 +12,12 @@ import psutil
 from datetime import datetime
 
 from backend.auth.dependencies import get_db, get_current_user, require_permission
-from backend.db.models import Collection, Document, CollectionPermission, IngestionJob, Model, User
+from backend.db.models import Chunk, Collection, Conversation, Document, CollectionPermission, IngestionJob, Model, User
 from backend.config import get_settings
 from backend.db.database import create_db_engine
 from backend.inference.lifecycle import ModelLifecycleManager
 from backend.retrieval.vector_store import VectorStore
+from backend.retrieval.hybrid import keyword_search, merge_hybrid_results, prepare_semantic_query
 from backend.documents.service import DocumentService
 
 router = APIRouter(tags=["knowledge"])
@@ -172,6 +173,7 @@ async def create_collection(
 @router.delete("/collections/{collection_id}")
 async def delete_collection(
     collection_id: str,
+    http_request: Request,
     current_user: User = Depends(require_permission("knowledge:delete")),
     db: Session = Depends(get_db)
 ):
@@ -187,10 +189,44 @@ async def delete_collection(
     
     if not perm and current_user.id != collection.owner_id:
         raise HTTPException(403, "Not authorized to delete this collection")
-    
-    db.delete(collection)
-    db.commit()
-    return {"success": True}
+
+    settings = get_settings()
+    collections_root = (Path(settings.knowledge_dir) / "collections").resolve()
+    source_root = (collections_root / collection.id).resolve()
+    try:
+        source_root.relative_to(collections_root)
+    except ValueError as exc:
+        raise HTTPException(500, "Knowledge source path is outside the configured storage directory") from exc
+
+    coordinator = http_request.app.state.ingestion
+    async with coordinator.mutation_lock:
+        # Conversations must not retain a reference to a source that no longer
+        # exists. Commit the relational deletion before using the vector store's
+        # separate SQLite connection, otherwise SQLite's write lock would deadlock.
+        db.query(Conversation).filter(Conversation.collection_id == collection.id).update(
+            {Conversation.collection_id: None}, synchronize_session=False
+        )
+        db.delete(collection)
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Could not delete knowledge source %s", collection.id)
+            raise HTTPException(500, "Could not delete the knowledge source") from exc
+
+        cleanup_warning = None
+        try:
+            await coordinator.vector_store.delete_collection(collection.id)
+        except Exception:
+            cleanup_warning = "The source was deleted, but unused vector data could not be cleaned up."
+            logger.exception("Could not remove vectors for deleted knowledge source %s", collection.id)
+        if source_root.exists():
+            try:
+                shutil.rmtree(source_root)
+            except OSError:
+                cleanup_warning = "The source was deleted, but some unused local files could not be cleaned up."
+                logger.exception("Could not remove files for deleted knowledge source %s", collection.id)
+    return {"success": True, "warning": cleanup_warning}
 
 @router.post("/collections/{collection_id}/documents", response_model=List[DocumentResponse])
 async def upload_documents(
@@ -219,7 +255,8 @@ async def upload_documents(
     max_document_bytes = max(1, settings.max_document_size_mb) * 1024 * 1024
     sources: list[tuple[Path, int]] = []
     available_memory = psutil.virtual_memory().available
-    memory_budget = max(0, available_memory - 512 * 1024 * 1024)
+    memory_reserve = 512 * 1024 * 1024
+    memory_budget = max(0, available_memory - memory_reserve)
 
     for file_path in request.filePaths:
         try:
@@ -241,11 +278,15 @@ async def upload_documents(
         estimated_peak_memory = size * MEMORY_MULTIPLIERS[source.suffix.lower()]
         if estimated_peak_memory > memory_budget:
             estimated_mb = max(1, estimated_peak_memory // (1024 * 1024))
-            available_mb = max(1, available_memory // (1024 * 1024))
+            available_mb = max(0, available_memory // (1024 * 1024))
+            budget_mb = memory_budget // (1024 * 1024)
+            reserve_mb = memory_reserve // (1024 * 1024)
             raise HTTPException(
                 413,
                 f"{source.name} may need about {estimated_mb} MB of working memory, "
-                f"but only {available_mb} MB is currently available",
+                f"but only {budget_mb} MB is available for ingestion "
+                f"({available_mb} MB free; {reserve_mb} MB reserved). "
+                "Close other applications or unload a chat model in Models, then try again.",
             )
         sources.append((source, size))
 
@@ -361,6 +402,7 @@ async def document_status(
 @router.delete("/documents/{document_id}")
 async def delete_document(
     document_id: str,
+    http_request: Request,
     current_user: User = Depends(require_permission("knowledge:write")),
     db: Session = Depends(get_db)
 ):
@@ -377,15 +419,37 @@ async def delete_document(
     
     if not perm and current_user.id != document.collection.owner_id:
         raise HTTPException(403, "Not authorized to delete this document")
-    
+
+    knowledge_root = Path(settings.knowledge_dir).resolve()
+    source_path = (knowledge_root / document.filepath).resolve()
     try:
-        (Path(settings.knowledge_dir) / document.filepath).unlink(missing_ok=True)
-    except:
-        pass
-    
-    db.delete(document)
-    db.commit()
-    return {"success": True}
+        source_path.relative_to(knowledge_root)
+    except ValueError as exc:
+        raise HTTPException(500, "Document path is outside the configured knowledge directory") from exc
+
+    chunk_ids = [row[0] for row in db.query(Chunk.id).filter(Chunk.document_id == document.id).all()]
+    coordinator = http_request.app.state.ingestion
+    async with coordinator.mutation_lock:
+        db.delete(document)
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Could not delete knowledge document %s", document.id)
+            raise HTTPException(500, "Could not delete the knowledge document") from exc
+
+        cleanup_warning = None
+        try:
+            await coordinator.vector_store.delete_chunks(chunk_ids)
+        except Exception:
+            cleanup_warning = "The document was deleted, but unused vector data could not be cleaned up."
+            logger.exception("Could not remove vectors for deleted document %s", document.id)
+        try:
+            source_path.unlink(missing_ok=True)
+        except OSError:
+            cleanup_warning = "The document was deleted, but its unused source file could not be cleaned up."
+            logger.exception("Could not remove the source file for deleted document %s", document.id)
+    return {"success": True, "warning": cleanup_warning}
 
 @router.post("/documents/{document_id}/reprocess")
 async def reprocess_document(
@@ -433,9 +497,29 @@ async def search_knowledge(
     provider = manager.get_embedding_provider()
     if provider is None or manager.active_embedding_model_id != model.id:
         provider = await manager.load_model(model, "embedding")
-    embedding = await provider.embed_single(request.query)
-    results = await http_request.app.state.ingestion.vector_store.search(
-        embedding, collection_ids=[c.id for c in collections], top_k=request.topK
+    collection_names = [collection.name for collection in collections]
+    semantic_query = prepare_semantic_query(request.query, collection_names)
+    if hasattr(provider, "embed_query"):
+        embedding = await provider.embed_query(semantic_query)
+    else:
+        embedding = await provider.embed_single(semantic_query)
+    candidate_limit = min(100, max(request.topK * 4, request.topK))
+    vector_results = await http_request.app.state.ingestion.vector_store.search(
+        embedding, collection_ids=[c.id for c in collections], top_k=candidate_limit
+    )
+    keyword_results = keyword_search(
+        db,
+        request.query,
+        [collection.id for collection in collections],
+        top_k=candidate_limit,
+        collection_names=collection_names,
+    ) if request.enableHybrid else []
+    results = merge_hybrid_results(
+        vector_results,
+        keyword_results,
+        minimum_vector_score=0.0,
+        top_k=request.topK,
+        vector_weight=request.hybridAlpha if request.enableHybrid else 1.0,
     )
     return [SearchResultResponse(
         chunkId=r.chunk_id, documentId=r.document_id, collectionId=r.collection_id,

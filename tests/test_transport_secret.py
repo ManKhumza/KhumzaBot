@@ -78,7 +78,9 @@ def test_transport_secret_correct_token_works(tmp_path, monkeypatch):
         # Correct transport token should work
         response = client.get("/health/ready", headers={"X-NOC-AI-Backend-Token": "test-transport-secret"})
         assert response.status_code == 200
-        assert response.json()["status"] == "ready"
+        assert response.json()["ready"] is True
+        assert response.json()["components"]["database"]["status"] == "healthy"
+        assert response.json()["components"]["vectorStore"]["status"] == "healthy"
 
     get_settings.cache_clear()
     create_db_engine.cache_clear()

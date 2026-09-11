@@ -15,6 +15,7 @@ backend/dist/
 *.db-shm
 *.db-wal
 .artifacts/
+resources/models/Qwen3-4B-Q4_K_M.gguf
 runtimes/llama/*.exe
 runtimes/llama/*.dll
 runtimes/python/

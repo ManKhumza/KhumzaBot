@@ -99,7 +99,7 @@ $modelFiles = @(Get-ChildItem -LiteralPath $InstallerPath -Recurse -File `
 Write-Check "GGUF model files present" ($modelFiles.Count -gt 0)
 
 # The build configuration is the authoritative elevation policy for NSIS.
-$builderConfig = Join-Path $ProjectRoot "apps\desktop\electron-builder.yml"
+$builderConfig = Join-Path $ProjectRoot "apps\desktop\electron\builder.yaml"
 $builderText = if (Test-Path -LiteralPath $builderConfig) {
     Get-Content -LiteralPath $builderConfig -Raw
 } else { "" }
@@ -131,6 +131,15 @@ try {
 # ── Summary ────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "=== Verification Summary ===" -ForegroundColor Cyan
+& (Join-Path $ProjectRoot '.venv\Scripts\python.exe') (Join-Path $PSScriptRoot 'release_integrity.py') --release $InstallerPath
+Write-Check 'Release checksums, resources, version and source freshness' ($LASTEXITCODE -eq 0)
+
+if ($RequireSignature) {
+    $CodeFiles = Get-ChildItem -LiteralPath $InstallerPath -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll', '.pyd' }
+    foreach ($CodeFile in $CodeFiles) {
+        Write-Check ('Authenticode: ' + $CodeFile.Name) ((Get-AuthenticodeSignature -LiteralPath $CodeFile.FullName).Status -eq 'Valid')
+    }
+}
 
 if ($FailCount -eq 0) {
     Write-Host "All checks passed." -ForegroundColor Green

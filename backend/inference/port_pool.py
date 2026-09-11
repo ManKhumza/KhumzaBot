@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import socket
 
 
 class PortPool:
@@ -32,7 +33,18 @@ class PortPool:
                     f"No free ports available in range for model {model_id}. "
                     f"All ports in use: {sorted(self._in_use.keys())}"
                 )
-            port = self._available.pop()
+            port = None
+            for candidate in sorted(self._available):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    try:
+                        probe.bind(("127.0.0.1", candidate))
+                    except OSError:
+                        continue
+                port = candidate
+                break
+            if port is None:
+                raise RuntimeError("No available loopback inference port; close the conflicting service and retry")
+            self._available.remove(port)
             self._in_use[port] = model_id
             return port
 

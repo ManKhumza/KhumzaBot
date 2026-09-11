@@ -6,11 +6,12 @@ import logging
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
+from backend.auth.dependencies import require_permission
 from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger("nocai.inference.routes")
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_permission("chat:create"))])
 
 # Timeout for upstream inference requests (seconds).
 # Chat completions can take a while, especially on CPU-only machines.
