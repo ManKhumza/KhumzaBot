@@ -6,7 +6,7 @@ import { Input } from '@/components/common/Input';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/common/Card';
 import { Badge } from '@/components/common/Badge';
 import { Dialog, AlertDialog } from '@/components/common/Dialog';
-import { Plus, Trash2, Play, Pause, Cpu, HardDrive, Download, Upload, Search, Loader2, AlertTriangle, CheckCircle, X } from 'lucide-react';
+import { Plus, Trash2, Play, Pause, Cpu, HardDrive, Download, Upload, Search, Loader2, AlertTriangle, CheckCircle, X, Folder, FolderOpen } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { Model, HardwareInfo, ResourceEstimate } from '@/types';
 
@@ -22,6 +22,7 @@ export const Models = () => {
   const [importRole, setImportRole] = useState<'chat' | 'embedding'>('chat');
   const [importName, setImportName] = useState('');
   const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
   const [scanResults, setScanResults] = useState<any[]>([]);
   const [scanning, setScanning] = useState(false);
   const [showScanResults, setShowScanResults] = useState(false);
@@ -50,23 +51,62 @@ export const Models = () => {
     }
   };
 
-  const handleScan = async () => {
-    if (!importPath) return;
+  const handleScan = async (path: string = importPath) => {
+    if (!path) return;
     setScanning(true);
+    setImportError(null);
     try {
-      const results = await nocaiAPI.models.scanDirectory(importPath);
+      const results = await nocaiAPI.models.scanDirectory(path);
       setScanResults(results.models);
       setShowScanResults(true);
     } catch (error) {
       console.error('Scan failed:', error);
+      setImportError(error instanceof Error ? error.message : 'Directory scan failed.');
     } finally {
       setScanning(false);
+    }
+  };
+
+  const openImportDialog = () => {
+    setImportError(null);
+    setShowImportDialog(true);
+  };
+
+  const handleBrowseModelFile = async () => {
+    setImportError(null);
+    try {
+      const files = await nocaiAPI.dialog.openFiles({
+        title: 'Select GGUF Model File',
+        filters: [{ name: 'GGUF Models', extensions: ['gguf'] }],
+      });
+      if (files && files.length > 0) {
+        setImportPath(files[0]);
+        setShowScanResults(false);
+      }
+    } catch (error) {
+      console.error('Browse failed:', error);
+      setImportError(error instanceof Error ? error.message : 'Could not open the file picker.');
+    }
+  };
+
+  const handleBrowseDirectory = async () => {
+    setImportError(null);
+    try {
+      const directory = await nocaiAPI.dialog.openDirectory();
+      if (directory) {
+        setImportPath(directory);
+        await handleScan(directory);
+      }
+    } catch (error) {
+      console.error('Browse failed:', error);
+      setImportError(error instanceof Error ? error.message : 'Could not open the directory picker.');
     }
   };
 
   const handleImport = async () => {
     if (!importPath) return;
     setImporting(true);
+    setImportError(null);
     try {
       await nocaiAPI.models.importModel({
         sourcePath: importPath,
@@ -76,9 +116,11 @@ export const Models = () => {
       setShowImportDialog(false);
       setImportPath('');
       setImportName('');
+      setShowScanResults(false);
       await loadData();
     } catch (error) {
       console.error('Import failed:', error);
+      setImportError(error instanceof Error ? error.message : 'Model import failed.');
     } finally {
       setImporting(false);
     }
@@ -153,11 +195,11 @@ export const Models = () => {
           <p className="text-muted-foreground">Manage your local AI models</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={() => setShowImportDialog(true)}>
+          <Button variant="outline" onClick={openImportDialog}>
             <Upload className="w-4 h-4 mr-2" />
             Import Model
           </Button>
-          <Button onClick={() => setShowImportDialog(true)}>
+          <Button onClick={openImportDialog}>
             <Plus className="w-4 h-4 mr-2" />
             Scan Directory
           </Button>
@@ -233,7 +275,7 @@ export const Models = () => {
                 <Cpu className="w-12 h-12 text-muted-foreground/50 mx-auto mb-4" />
                 <h3 className="text-lg font-medium text-foreground mb-2">No chat models imported</h3>
                 <p className="text-muted-foreground mb-4">Import a GGUF model to start chatting</p>
-                <Button onClick={() => setShowImportDialog(true)}>
+                <Button onClick={openImportDialog}>
                   <Plus className="w-4 h-4 mr-2" />
                   Import Model
                 </Button>
@@ -269,7 +311,7 @@ export const Models = () => {
                 <HardDrive className="w-12 h-12 text-muted-foreground/50 mx-auto mb-4" />
                 <h3 className="text-lg font-medium text-foreground mb-2">No embedding models imported</h3>
                 <p className="text-muted-foreground mb-4">Import a GGUF embedding model for knowledge retrieval</p>
-                <Button onClick={() => setShowImportDialog(true)} variant="outline">
+                <Button onClick={openImportDialog} variant="outline">
                   <Plus className="w-4 h-4 mr-2" />
                   Import Model
                 </Button>
@@ -283,18 +325,39 @@ export const Models = () => {
       <Dialog open={showImportDialog} onOpenChange={setShowImportDialog} title="Import Model" description="Select a local GGUF model file or scan a directory">
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium mb-1">Model Directory</label>
-            <div className="flex gap-2">
+            <label className="block text-sm font-medium mb-1">Model File or Directory</label>
+            <div className="flex flex-wrap gap-2">
               <Input
                 value={importPath}
                 onChange={(e) => setImportPath(e.target.value)}
-                placeholder="C:\\Models or /home/user/models"
+                placeholder="C:\\Models\\model.gguf or C:\\Models"
+                aria-label="Model file or directory path"
               />
-              <Button variant="outline" onClick={handleScan} isLoading={scanning}>
+              <Button
+                variant="outline"
+                onClick={handleBrowseModelFile}
+                title="Browse for a GGUF model file"
+                aria-label="Browse for a GGUF model file"
+              >
+                <FolderOpen className="w-4 h-4 mr-1" />
+                Browse…
+              </Button>
+              <Button
+                variant="outline"
+                onClick={handleBrowseDirectory}
+                title="Choose a directory to scan"
+                aria-label="Choose a directory to scan"
+              >
+                <Folder className="w-4 h-4" />
+              </Button>
+              <Button variant="outline" onClick={() => handleScan()} isLoading={scanning}>
                 <Search className="w-4 h-4" />
                 Scan
               </Button>
             </div>
+            {importError && (
+              <p className="mt-1.5 text-sm text-destructive" role="alert">{importError}</p>
+            )}
           </div>
 
           {showScanResults && scanResults.length > 0 && (

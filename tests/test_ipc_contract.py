@@ -186,6 +186,37 @@ def test_large_document_picker_and_upload_contract():
     assert "uploadFiles.map((file) => file.path)" in knowledge_content
 
 
+def test_model_import_native_picker_contract():
+    """IPC contract: model import browses a user-chosen file or directory with the native picker."""
+    root = Path(__file__).parents[1]
+    main_content = (root / "apps" / "desktop" / "electron" / "main.ts").read_text()
+    preload_content = (root / "apps" / "desktop" / "preload" / "preload.ts").read_text()
+    api_content = (root / "apps" / "desktop" / "renderer" / "src" / "utils" / "api.ts").read_text()
+    models_content = (root / "apps" / "desktop" / "renderer" / "src" / "pages" / "Models.tsx").read_text()
+
+    # Electron main registers both picker channels.
+    assert "ipcMain.handle('dialog:openDirectory'" in main_content
+    assert "ipcMain.handle('dialog:openFiles'" in main_content
+    assert "properties: ['openDirectory']" in main_content
+    assert "properties: ['openFile', 'multiSelections']" in main_content
+
+    # Preload exposes the picker channels on window.nocai.
+    assert "openDirectory: () => ipcRenderer.invoke('dialog:openDirectory')" in preload_content
+    assert "openFiles: (options?: any) => ipcRenderer.invoke('dialog:openFiles', options)" in preload_content
+
+    # The renderer API wrapper surfaces the pickers after backend readiness.
+    assert "dialog = {" in api_content
+    assert "return window.nocai.dialog.openDirectory();" in api_content
+    assert "return window.nocai.dialog.openFiles(options);" in api_content
+
+    # The import dialog lets the user retrieve a model from a directory of their choice.
+    assert "nocaiAPI.dialog.openFiles" in models_content
+    assert "nocaiAPI.dialog.openDirectory" in models_content
+    assert "extensions: ['gguf']" in models_content
+    assert "handleBrowseModelFile" in models_content
+    assert "handleBrowseDirectory" in models_content
+
+
 def test_renderer_failure_is_contained_and_recoverable():
     """A route render failure has an in-app fallback and a process-level reload path."""
     root = Path(__file__).parents[1]

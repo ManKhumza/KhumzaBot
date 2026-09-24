@@ -12,7 +12,7 @@ from datetime import datetime
 
 from backend.auth.dependencies import get_db, get_current_user, require_permission
 from backend.db.models import Collection, Conversation, Document, Message, Model, User
-from backend.inference.lifecycle import ModelLifecycleManager
+from backend.inference.lifecycle import ModelLifecycleManager, ModelProvider
 
 router = APIRouter(tags=["chat"])
 logger = logging.getLogger(__name__)
@@ -81,13 +81,18 @@ def get_settings(request: Request):
     return request.app.state.settings
 
 async def call_llama_server(
-    client: httpx.AsyncClient,
+    provider: ModelProvider,
     messages: List[dict],
     temperature: float,
     max_tokens: int,
     stream: bool,
 ) -> AsyncGenerator[dict, None]:
     """Call llama-server for chat completion."""
+    if provider.client is None:
+        raise RuntimeError("Chat runtime is not ready")
+
+    client = provider.client
+    headers = provider.authorization_headers
     payload = {
         "messages": messages,
         "temperature": temperature,
@@ -96,13 +101,22 @@ async def call_llama_server(
     }
     
     if not stream:
-        response = await client.post("/v1/chat/completions", json=payload)
+        response = await client.post(
+            "/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         yield response.json()
         return
 
-    async with client.stream("POST", "/v1/chat/completions", json=payload) as response:
+    async with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json=payload,
+        headers=headers,
+    ) as response:
         if response.status_code != 200:
             error_text = await response.aread()
             raise HTTPException(status_code=response.status_code, detail=error_text.decode())
@@ -358,7 +372,7 @@ async def chat_completion(
             base_url = f"http://127.0.0.1:{model_manager.get_chat_provider().port}"
             
             async for chunk_data in call_llama_server(
-                client=chat_provider.client,
+                provider=chat_provider,
                 messages=history,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -417,7 +431,7 @@ async def chat_completion(
         usage = None
         
         async for chunk_data in call_llama_server(
-            client=chat_provider.client,
+            provider=chat_provider,
             messages=history,
             temperature=temperature,
             max_tokens=max_tokens,

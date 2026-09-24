@@ -51,6 +51,20 @@ def test_bootstrap_login_and_protected_model_endpoints(tmp_path, monkeypatch):
         assert scan.status_code == 200, scan.text
         assert scan.json()["models"][0]["filename"] == model_file.name
 
+        # Import retrieves the model from the user's chosen directory (not the
+        # managed models directory) and preserves the original source file.
+        imported = client.post(
+            "/api/v1/models/import",
+            headers=headers,
+            json={"sourcePath": str(model_file), "role": "chat"},
+        )
+        assert imported.status_code == 200, imported.text
+        imported_path = Path(imported.json()["filepath"])
+        assert imported_path.exists()
+        assert imported_path.is_relative_to(data_dir / "models" / "chat")
+        assert model_file.exists()
+        assert imported.json()["role"] == "chat"
+
         estimate = client.post("/api/v1/models/estimate", headers=headers, json={"path": str(model_file)})
         assert estimate.status_code == 200, estimate.text
 

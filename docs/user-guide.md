@@ -61,7 +61,7 @@
 ### Importing Models
 1. Go to **Models** page
 2. Click **Import Model** or **Scan Directory**
-3. Select a `.gguf` file or directory
+3. Click **Browse…** to pick a `.gguf` file, or the folder button to choose a directory to scan
 4. Choose role: **Chat Model** or **Embedding Model**
 5. Click **Import**
 

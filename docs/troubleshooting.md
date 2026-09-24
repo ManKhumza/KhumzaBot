@@ -313,6 +313,52 @@ Change in **Settings → Diagnostics → Log Level**:
 
 ## Emergency Procedures
 
+### Locked Out: Reset the Database
+
+Use this when you forgot the administrator password, credentials stop working,
+or the database is corrupted. It deletes only `nocai.db` (plus its `-wal` and
+`-shm` companion files). Models, knowledge files, and settings are untouched.
+
+#### What the reset does
+1. Copies `nocai.db`, `nocai.db-wal`, and `nocai.db-shm` to
+   `%APPDATA%\NOC AI Assistant\backups\db-reset-<timestamp>\` together with a
+   SHA-256 `manifest.json`.
+2. Deletes the original database files (with rollback if a delete fails).
+3. On the next launch the first-run screen appears; the first login creates a
+   brand-new administrator account.
+
+#### Steps
+1. Close NOC AI Assistant completely.
+2. Run this from a repository checkout:
+
+```powershell
+pwsh -NoProfile -File .\scripts\reset-db.ps1
+```
+
+   - You must type `RESET` to confirm.
+   - Add `-Force` to stop running application processes automatically instead
+     of closing the app manually.
+   - Add `-Yes` to skip the prompt for non-interactive use.
+3. Start NOC AI Assistant and create the new administrator account.
+
+#### Undo a reset (restore a backup)
+
+```powershell
+pwsh -NoProfile -File .\scripts\reset-db.ps1 -RestoreFrom "$env:APPDATA\NOC AI Assistant\backups\db-reset-<timestamp>"
+```
+
+Type `RESTORE` to confirm (or pass `-Yes`). The database being replaced is
+backed up first, so a restore is reversible too. Backups are verified against
+their SHA-256 manifest before being restored.
+
+#### Notes
+- Conversations, accounts, and audit history live only in the database; after a
+  reset they exist solely in the backup until you restore it.
+- Backups live inside the profile directory and are removed by Complete Reset
+  below - copy them elsewhere for long-term retention.
+- Installed machines without a repository checkout can copy
+  `scripts\reset-db.ps1` from the source tree and run it the same way.
+
 ### Complete Reset
 ```powershell
 # 1. Uninstall application

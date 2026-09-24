@@ -69,11 +69,63 @@ def test_fault_injection_port_collision(tmp_path):
     assert hasattr(ModelLifecycleManager, '_get_free_port')
 
 
-def test_fault_injection_corrupt_model(tmp_path):
-    """Fault injection: corrupt GGUF file handled gracefully."""
+def test_fault_injection_corrupt_model(tmp_path, monkeypatch):
+    """Fault injection: a corrupt (non-GGUF) model file is flagged invalid, not imported."""
+    monkeypatch.setenv("NOC_AI_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOC_AI_MODELS_DIR", str(tmp_path / "models"))
+    monkeypatch.setenv("NOC_AI_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+    monkeypatch.setenv("NOC_AI_LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("NOC_AI_DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
+
+    from backend.config import get_settings
     from backend.models.service import ModelService
-    
-    # Test that invalid model files are detected
+
+    get_settings.cache_clear()
+
+    scan_dir = tmp_path / "corrupt"
+    scan_dir.mkdir()
+    bad = scan_dir / "model.gguf"
+    # Non-GGUF bytes: a header that is not the GGUF magic, followed by junk.
+    bad.write_bytes(b"CORRUPTGGUF" + b"\x00" * 256)
+
+    try:
+        results = asyncio.run(ModelService(None).scan_directory(str(scan_dir)))
+    finally:
+        get_settings.cache_clear()
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.filename == "model.gguf"
+    assert result.is_valid_gguf is False
+    assert result.metadata is None
+    assert result.error is not None
+    # A corrupt model must never be classified as importable.
+    assert result.suggested_role is None
+
+
+def test_fault_injection_corrupt_model_import_rejected(tmp_path, monkeypatch):
+    """Importing a corrupt GGUF raises ValueError instead of silently succeeding."""
+    import pytest
+
+    monkeypatch.setenv("NOC_AI_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOC_AI_MODELS_DIR", str(tmp_path / "models"))
+    monkeypatch.setenv("NOC_AI_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+    monkeypatch.setenv("NOC_AI_LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("NOC_AI_DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
+
+    from backend.config import get_settings
+    from backend.models.service import ModelService
+
+    get_settings.cache_clear()
+
+    bad = tmp_path / "bad.gguf"
+    bad.write_bytes(b"NOTGGUF" + b"\x00" * 256)
+
+    try:
+        with pytest.raises(ValueError, match="Invalid GGUF file"):
+            asyncio.run(ModelService(None).import_model(str(bad), role="chat"))
+    finally:
+        get_settings.cache_clear()
 
 
 def test_fault_injection_write_protect_data_dir(tmp_path):

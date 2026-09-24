@@ -499,6 +499,22 @@ class NocAIAPI {
       },
     };
 
+    // Dialogs
+    dialog = {
+      openDirectory: async () => {
+        await this.ensureReady();
+        return window.nocai.dialog.openDirectory();
+      },
+      openFiles: async (options?: { filters?: any[]; title?: string }) => {
+        await this.ensureReady();
+        return window.nocai.dialog.openFiles(options);
+      },
+      saveFile: async (options?: { filters?: any[]; title?: string; defaultPath?: string }) => {
+        await this.ensureReady();
+        return window.nocai.dialog.saveFile(options);
+      },
+    };
+
     // Events
     onBackendStatusChange = (callback: (status: BackendStatusEvent) => void) => {
       this.ensureReady().then(() => {

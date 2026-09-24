@@ -37,6 +37,11 @@ class ModelProvider:
     stderr_tail: list[str] = field(default_factory=list)
     api_key: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
+    @property
+    def authorization_headers(self) -> dict[str, str]:
+        """Return the private credential required by this llama.cpp process."""
+        return {"Authorization": f"Bearer {self.api_key}"}
+
     async def embed_single(self, text: str) -> list[float]:
         embeddings = await self.embed_batch([text])
         return embeddings[0]
@@ -59,6 +64,7 @@ class ModelProvider:
         response = await self.client.post(
             "/v1/embeddings",
             json={"input": texts},
+            headers=self.authorization_headers,
         )
         if response.status_code >= 400:
             detail = response.text.lower()
@@ -245,7 +251,7 @@ class ModelLifecycleManager:
         provider.client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(300.0, connect=10.0),
-            headers={"Authorization": f"Bearer {provider.api_key}"},
+            headers=provider.authorization_headers,
         )
         
         if not await self._health_check(provider):
@@ -272,7 +278,7 @@ class ModelLifecycleManager:
                 async with httpx.AsyncClient(timeout=2.0) as client:
                     resp = await client.get(
                         f"http://127.0.0.1:{provider.port}/health",
-                        headers={"Authorization": f"Bearer {provider.api_key}"},
+                        headers=provider.authorization_headers,
                     )
                     if resp.status_code == 200:
                         data = resp.json()

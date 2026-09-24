@@ -51,20 +51,54 @@ def test_embedding_runtime_384_dimension_vector(tmp_path, monkeypatch):
 
 
 def test_embedding_dimension_validation(tmp_path):
-    """Embedding: vector dimension must match model (384 for BGE)."""
-    from backend.retrieval.vector_store import VectorStore
-    
-    # Test that VectorStore validates embedding dimensions
-    # This is a unit test for the dimension validation logic
-    import tempfile
-    import os
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test.db")
-        # VectorStore with 384-dim should work for BGE
-        store = VectorStore(db_path, 384)
-        # Verify dimension is stored
-        assert store.embedding_dim == 384
+    """Embedding: a vector with the wrong number of dimensions is rejected."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import pytest
+
+    from backend.retrieval.vector_store import ChunkWithEmbedding, VectorStore
+
+    store = VectorStore(str(tmp_path / "vectors.db"), 4)
+    try:
+        chunk = SimpleNamespace(id="chunk-1", collection_id="coll-1", document_id="doc-1")
+
+        # add_chunks must reject a wrong-dim embedding (expects 4, got 3).
+        with pytest.raises(ValueError, match="Expected 4 embedding values"):
+            asyncio.run(
+                store.add_chunks([ChunkWithEmbedding(chunk=chunk, embedding=[1.0, 2.0, 3.0])])
+            )
+
+        # search must reject a wrong-dim query (expects 4, got 5).
+        with pytest.raises(ValueError, match="Expected 4 query values"):
+            asyncio.run(store.search([1.0, 2.0, 3.0, 4.0, 5.0]))
+
+        # A matching-dim embedding is accepted and stored.
+        asyncio.run(
+            store.add_chunks([ChunkWithEmbedding(chunk=chunk, embedding=[1.0, 2.0, 0.0, 0.0])])
+        )
+    finally:
+        store.close()
+
+    # The stored vector must have been normalised to unit length.
+    import numpy as np
+    import sqlite3
+    import sqlite_vec
+
+    conn = sqlite3.connect(str(tmp_path / "vectors.db"))
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        row = conn.execute(
+            "SELECT embedding FROM chunks_vec WHERE chunk_id='chunk-1'"
+        ).fetchone()
+        assert row is not None
+        stored = np.frombuffer(row[0], dtype=np.float32)
+        assert stored.shape == (4,)
+        assert abs(float(np.linalg.norm(stored)) - 1.0) < 1e-6
+    finally:
+        conn.close()
 
 
 def test_embedding_runtime_batches_and_orders_vectors():
@@ -90,8 +124,9 @@ def test_embedding_runtime_batches_and_orders_vectors():
         def __init__(self):
             self.payload = None
 
-        async def post(self, _path, json):
+        async def post(self, _path, json, headers=None):
             self.payload = json
+            self.headers = headers
             return FakeResponse()
 
     client = FakeClient()
@@ -99,6 +134,7 @@ def test_embedding_runtime_batches_and_orders_vectors():
     vectors = asyncio.run(provider.embed_batch(["first", "second"]))
 
     assert client.payload == {"input": ["first", "second"]}
+    assert client.headers == provider.authorization_headers
     assert vectors == [[1.0, 1.0], [2.0, 2.0]]
 
 
@@ -131,8 +167,10 @@ def test_embedding_runtime_splits_oversized_inputs():
         def __init__(self):
             self.requests = []
 
-        async def post(self, _path, json):
+        async def post(self, _path, json, headers=None):
             self.requests.append(json["input"])
+            assert headers
+            assert headers["Authorization"].startswith("Bearer ")
             return FakeResponse(json["input"])
 
     client = FakeClient()
