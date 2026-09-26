@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     default_threads: int = 0
     default_gpu_layers: int = -1
     max_concurrent_generations: int = 1
+    # A fully offline CPU model can need minutes for one answer. The request
+    # limit must be generous enough to finish a bounded generation instead of
+    # turning normal local latency into an HTTP 500.
+    chat_generation_timeout_seconds: float = 3600.0
+    embedding_request_timeout_seconds: float = 300.0
+    # Reading multi-gigabyte weights from disk can be slow on a busy machine.
+    model_load_timeout_seconds: float = 180.0
     
     # Knowledge
     default_chunk_size: int = 384

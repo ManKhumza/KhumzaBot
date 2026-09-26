@@ -288,6 +288,73 @@ class TestMigration:
         backup_path = db_path.with_suffix(".db.bak")
         assert backup_path.exists()
 
+    def test_migration_preserves_data_that_only_exists_in_the_write_ahead_log(self, tmp_path):
+        """A committed row parked in the -wal file must survive encryption.
+
+        The reported profile shipped a 5 MB ``nocai.db-wal`` and both sidecars
+        must be part of the migration's backup and export contract rather than
+        being ignored.
+        """
+        import shutil
+        import sqlite3
+        from backend.security.encryption import (
+            create_encrypted_connection,
+            migrate_to_encrypted,
+        )
+
+        source = tmp_path / "source.db"
+        connection = sqlite3.connect(str(source))
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+        connection.execute("INSERT INTO messages (body) VALUES ('checkpointed')")
+        connection.commit()
+        connection.execute("INSERT INTO messages (body) VALUES ('wal-only row')")
+        connection.commit()
+        source_wal = source.with_name(source.name + "-wal")
+        source_shm = source.with_name(source.name + "-shm")
+        assert source_wal.stat().st_size > 0, "The fixture needs a populated write-ahead log"
+
+        # A crashed application leaves this exact pair behind for the next start.
+        db_path = tmp_path / "nocai.db"
+        shutil.copy2(source, db_path)
+        shutil.copy2(source_wal, db_path.with_name(db_path.name + "-wal"))
+        if source_shm.exists():
+            shutil.copy2(source_shm, db_path.with_name(db_path.name + "-shm"))
+        connection.close()
+
+        readable = sqlite3.connect(str(db_path))
+        expected = [row[0] for row in readable.execute("SELECT body FROM messages ORDER BY id")]
+        readable.close()
+        assert expected == ["checkpointed", "wal-only row"]
+
+        key = secrets.token_bytes(32)
+        migrate_to_encrypted(db_path, key)
+
+        encrypted = create_encrypted_connection(db_path, key)
+        bodies = [row[0] for row in encrypted.execute("SELECT body FROM messages ORDER BY id")]
+        encrypted.close()
+
+        assert bodies == expected
+
+    def test_migration_removes_plaintext_sidecars_after_replacement(self, tmp_path):
+        """No plaintext write-ahead log or shared-memory file may survive migration."""
+        import sqlite3
+        from backend.security.encryption import migrate_to_encrypted
+
+        db_path = tmp_path / "nocai.db"
+        key = secrets.token_bytes(32)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        migrate_to_encrypted(db_path, key)
+
+        assert not db_path.with_name(db_path.name + "-wal").exists()
+        assert not db_path.with_name(db_path.name + "-shm").exists()
+        assert db_path.read_bytes()[:15] != b"SQLite format 3"
+
 
 class TestDatabaseIntegration:
     """Exercise the application database factory with an isolated profile."""

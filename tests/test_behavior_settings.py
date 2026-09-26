@@ -110,7 +110,7 @@ def test_knowledge_only_chat_refuses_without_sources_and_cites_grounded_context(
     captured_messages = []
     fake_answer = {"content": "Restart the router only after validation [Source 1]."}
 
-    async def fake_llama_server(client, messages, temperature, max_tokens, stream):
+    async def fake_llama_server(provider, messages, temperature, max_tokens, stream):
         captured_messages.extend(messages)
         yield {
             "choices": [{

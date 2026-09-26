@@ -89,9 +89,11 @@ def test_embedding_runtime_batches_and_orders_vectors():
     class FakeClient:
         def __init__(self):
             self.payload = None
+            self.headers = None
 
-        async def post(self, _path, json):
+        async def post(self, _path, json, headers=None):
             self.payload = json
+            self.headers = headers
             return FakeResponse()
 
     client = FakeClient()
@@ -99,6 +101,9 @@ def test_embedding_runtime_batches_and_orders_vectors():
     vectors = asyncio.run(provider.embed_batch(["first", "second"]))
 
     assert client.payload == {"input": ["first", "second"]}
+    # The llama.cpp runtime is started with a per-process API key, so every
+    # embedding request must carry the matching credential.
+    assert client.headers == {"Authorization": f"Bearer {provider.api_key}"}
     assert vectors == [[1.0, 1.0], [2.0, 2.0]]
 
 
@@ -120,7 +125,7 @@ def test_embedding_runtime_applies_query_prefix_only_to_queries():
         def __init__(self):
             self.inputs = []
 
-        async def post(self, _path, json):
+        async def post(self, _path, json, headers=None):
             self.inputs.append(json["input"])
             return FakeResponse()
 
@@ -168,7 +173,7 @@ def test_embedding_runtime_splits_oversized_inputs():
         def __init__(self):
             self.requests = []
 
-        async def post(self, _path, json):
+        async def post(self, _path, json, headers=None):
             self.requests.append(json["input"])
             return FakeResponse(json["input"])
 

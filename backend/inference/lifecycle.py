@@ -79,6 +79,11 @@ class ModelProvider:
     api_key: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
     query_prefix: str = ""
 
+    @property
+    def authorization_headers(self) -> dict[str, str]:
+        """Return the private credential required by this llama.cpp process."""
+        return {"Authorization": f"Bearer {self.api_key}"}
+
     async def embed_single(self, text: str) -> list[float]:
         return (await self.embed_batch([text]))[0]
 
@@ -103,7 +108,11 @@ class ModelProvider:
     async def _request_embeddings(self, texts: list[str]) -> list[list[float]]:
         if self.client is None:
             raise RuntimeError("Embedding runtime is not ready")
-        response = await self.client.post("/v1/embeddings", json={"input": texts})
+        response = await self.client.post(
+            "/v1/embeddings",
+            json={"input": texts},
+            headers=self.authorization_headers,
+        )
         if response.status_code >= 400 and any(
             fragment in response.text.lower()
             for fragment in (
@@ -189,7 +198,7 @@ class LlamaServerProcess:
         api_key: str | None = None,
         extra_args: list[str] | None = None,
         host: str = "127.0.0.1",
-        health_timeout: float = 60.0,
+        health_timeout: float = 180.0,
     ) -> None:
         self.model_path = Path(model_path)
         self.port = port
@@ -610,14 +619,30 @@ class ModelLifecycleManager:
             role=role,
             api_key=provider.api_key,
             extra_args=_role_specific_runtime_args(model, role),
+            # Loading multi-gigabyte weights from disk on a busy CPU-only machine
+            # routinely exceeds a minute, so the readiness budget must be generous.
+            health_timeout=float(getattr(self.settings, "model_load_timeout_seconds", 180.0)),
         )
         provider.process = server
         try:
             await server.start()
             provider.client = httpx.AsyncClient(
                 base_url=f"http://{server.host}:{server.port}",
-                timeout=httpx.Timeout(300.0, connect=10.0),
-                headers={"Authorization": f"Bearer {provider.api_key}"},
+                # Chat decoding on CPU can legitimately take many minutes for one
+                # answer; embeddings stay short so a stuck runtime fails fast.
+                timeout=httpx.Timeout(
+                    float(
+                        getattr(
+                            self.settings,
+                            "embedding_request_timeout_seconds"
+                            if role == "embedding"
+                            else "chat_generation_timeout_seconds",
+                            300.0,
+                        )
+                    ),
+                    connect=10.0,
+                ),
+                headers=provider.authorization_headers,
             )
         except BaseException:
             await server.stop()
@@ -794,13 +819,22 @@ class ModelLifecycleManager:
         """Locate the llama-server binary.
 
         Search order:
-            1. settings.llama_server_path (if set)
-            2. resources/bin/llama-server.exe  (Windows)
-            3. resources/bin/llama-server      (Linux/macOS)
+            1. settings.llama_server_path (set by the desktop host)
+            2. bundled ``resources/llama/llama-server.exe`` beside the runtime
+            3. repository ``runtimes/llama/llama-server.exe`` for source runs
             4. System PATH via shutil.which
+
+        Resolution never depends on the process working directory: the desktop
+        host starts the backend with its own cwd, and a packaged install keeps
+        the runtime under the application resources directory.
         """
+        override = getattr(self.settings, "llama_server_path", None)
+        package_root = Path(__file__).resolve().parents[3]
         candidates: list[Path | str | None] = [
-            getattr(self.settings, "llama_server_path", None),
+            override if override and Path(override).is_file() else None,
+            package_root / "llama" / "llama-server.exe",
+            package_root / "llama" / "llama-server",
+            package_root / "runtimes" / "llama" / "llama-server.exe",
             Path("resources/bin/llama-server.exe"),
             Path("resources/bin/llama-server"),
             shutil.which("llama-server"),
@@ -816,6 +850,6 @@ class ModelLifecycleManager:
         searched = ", ".join(str(c) for c in candidates if c is not None)
         raise FileNotFoundError(
             f"llama-server binary not found. Searched: {searched}. "
-            f"Place the binary at resources/bin/llama-server.exe "
-            f"or set settings.llama_server_path."
+            f"Reinstall the application or set NOC_AI_LLAMA_SERVER_PATH to the "
+            f"bundled llama-server executable."
         )

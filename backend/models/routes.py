@@ -101,7 +101,7 @@ async def import_model(
     db: Session = Depends(get_db)
 ):
     settings = get_settings()
-    source = Path(request.sourcePath).resolve()
+    source = Path(request.sourcePath).expanduser().resolve()
     
     if not source.is_file():
         raise HTTPException(404, "Source file not found")

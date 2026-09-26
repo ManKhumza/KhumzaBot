@@ -34,6 +34,8 @@ const nativeFetch = globalThis.fetch;
 let journal: DiagnosticJournal | null = null;
 let loggingFailed = false;
 const activeGenerations = new Map<string, AbortController>();
+/** Outlive the backend's own chat deadline so its actionable error wins. */
+const CHAT_GENERATION_TIMEOUT_MS = 3_700_000;
 const approvedReadPaths = new Map<string, number>();
 const approvedWritePaths = new Map<string, number>();
 
@@ -725,8 +727,10 @@ function setupIpcHandlers(): void {
     const controller = new AbortController();
     activeGenerations.set(request.conversationId, controller);
     try {
+      // A fully offline CPU model can need minutes for one answer. The user can
+      // always stop a generation, so the bridge must not abort it early.
       const response = await fetch(`http://127.0.0.1:${backendPort}/api/v1/chat/completions`, {
-        method: 'POST', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(180000)]),
+        method: 'POST', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(CHAT_GENERATION_TIMEOUT_MS)]),
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionToken}` },
         body: JSON.stringify({ ...request, stream: false }),
       });

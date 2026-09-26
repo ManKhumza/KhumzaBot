@@ -12,6 +12,18 @@ function backendMember(electronApp) {
   return interpreters[0];
 }
 
+function rendererState(electronApp, oldPid) {
+  return electronApp.evaluate(({ BrowserWindow }, previous) => {
+    const contents = BrowserWindow.getAllWindows()[0].webContents;
+    return {
+      replaced: contents.getOSProcessId() !== previous,
+      crashed: contents.isCrashed(),
+      loading: contents.isLoading(),
+      exitReason: global.__rendererExit?.reason,
+    };
+  }, oldPid);
+}
+
 function controlOwned(member, operation) {
   // PID and birth time both match before fault injection; no broad process-name kill.
   execFileSync(python, ['-c',
@@ -80,17 +92,24 @@ test('a renderer crash restores the interface and records a diagnostic without d
   // Exercise Chromium's real crash path explicitly: external termination under
   // the automation debugger can leave the target without a renderer-exit event.
   await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.forcefullyCrashRenderer());
+  // Chromium occasionally declines the forced crash while a debugger owns the
+  // target. If the original renderer is still alive after a bounded wait,
+  // terminate that exact process instead: the application must recover from a
+  // renderer that is killed externally too.
+  const injected = await expect.poll(() => rendererState(electronApp, rendererPid).then(state => state.replaced),
+    { timeout: 10000 }).toBe(true).then(() => true, () => false);
+  if (!injected && processMetrics(renderer.pid).some(member =>
+    member.pid === renderer.pid && member.started === renderer.started)) {
+    controlOwned(renderer, 'kill');
+  }
   // Playwright retains the crashed target's action scope. Query the replacement
   // renderer through Electron while the application's own reload recreates it.
-  await expect.poll(() => electronApp.evaluate(({ BrowserWindow }, oldPid) => {
-    const contents = BrowserWindow.getAllWindows()[0].webContents;
-    return {
-      replaced: contents.getOSProcessId() !== oldPid,
-      crashed: contents.isCrashed(),
-      loading: contents.isLoading(),
-      exitReason: global.__rendererExit?.reason,
-    };
-  }, rendererPid), { timeout: 30000 }).toEqual({ replaced: true, crashed: false, loading: false, exitReason: expect.any(String) });
+  await expect.poll(() => rendererState(electronApp, rendererPid), { timeout: 30000 }).toEqual({
+    replaced: true,
+    crashed: false,
+    loading: false,
+    exitReason: expect.any(String),
+  });
   await expect.poll(() => processMetrics(renderer.pid).filter(member =>
     member.pid === renderer.pid && member.started === renderer.started).length,
   { timeout: 15000, message: 'The original renderer process must exit after fault injection' }).toBe(0);

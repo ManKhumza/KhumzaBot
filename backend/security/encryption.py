@@ -192,12 +192,31 @@ def migrate_to_encrypted(
     logger.info("Migrating database to encrypted format...")
 
     try:
-        # Step 1: Back up the original
+        # Step 1: Back up the original, including any write-ahead log and shared
+        # memory sidecars. Committed rows can live only in the -wal file, so a
+        # sidecar-less backup would be an incomplete recovery point.
         import shutil
-        shutil.copy2(db_path, backup_path)
+        sidecars = [db_path.with_name(db_path.name + suffix) for suffix in ("-wal", "-shm")]
+
+        def copy_database(target: Path) -> None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(db_path, target)
+            for sidecar in sidecars:
+                if sidecar.exists():
+                    shutil.copy2(sidecar, target.with_name(target.name + sidecar.name[len(db_path.name):]))
+
+        copy_database(Path(backup_path))
         logger.info("Backed up original database to %s", backup_path)
 
-        # Step 2: Open the unencrypted database
+        # Step 2: Fold any committed WAL frames into the main database file so
+        # the exported copy is complete, then open the unencrypted database.
+        checkpoint = sqlite3.connect(str(db_path))
+        try:
+            checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            checkpoint.commit()
+        finally:
+            checkpoint.close()
+
         plain_conn = sqlcipher.connect(str(db_path))
 
         # Step 3: Attach a new encrypted database
@@ -216,9 +235,17 @@ def migrate_to_encrypted(
         plain_conn.execute("DETACH DATABASE encrypted")
         plain_conn.close()
 
-        # Step 6: Replace original with encrypted version
+        # Step 6: Verify the encrypted copy before replacing the original.
+        if not verify_encryption(encrypted_path, encryption_key):
+            raise RuntimeError("The encrypted database copy could not be verified")
+        if encrypted_path.stat().st_size == 0:
+            raise RuntimeError("The encrypted database copy is empty")
+
+        # Step 7: Replace the plaintext file and drop its stale sidecars.
         db_path.unlink()
         encrypted_path.rename(db_path)
+        for suffix in ("-wal", "-shm"):
+            db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
         logger.info("Database migration to encrypted format complete")
 

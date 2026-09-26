@@ -14,8 +14,9 @@ from datetime import datetime
 
 from backend.auth.dependencies import get_db, get_current_user, require_permission
 from backend.api.routes import load_effective_settings
+from backend.config import get_settings
 from backend.db.models import Collection, CollectionPermission, Conversation, Document, Message, Model, User
-from backend.inference.lifecycle import ModelLifecycleManager
+from backend.inference.lifecycle import ModelLifecycleManager, ModelProvider
 from backend.retrieval.hybrid import keyword_search, merge_hybrid_results, prepare_semantic_query
 
 router = APIRouter(tags=["chat"])
@@ -141,42 +142,108 @@ def _ensure_source_references(content: str, source_count: int) -> tuple[str, boo
     references = " ".join(f"[Source {index}]" for index in range(1, source_count + 1))
     return f"{cleaned}\n\nSources: {references}", True
 
+# A request may not start an unbounded local generation. The resolved limit is
+# the smallest of the request, the conversation, the configured response cap and
+# the room left inside the model context window.
+ABSOLUTE_RESPONSE_TOKEN_LIMIT = 2048
+CONTEXT_RESERVE_TOKENS = 256
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _estimate_prompt_tokens(messages: List[dict]) -> int:
+    characters = sum(len(str(message.get("content") or "")) for message in messages)
+    return characters // CHARS_PER_TOKEN_ESTIMATE + len(messages) * 4
+
+
+def _resolve_response_token_limit(
+    messages: List[dict],
+    conversation_limit: int | None,
+    request_limit: int | None,
+    context_length: int | None,
+) -> int:
+    requested = [value for value in (request_limit, conversation_limit) if value]
+    limit = min(min(requested), ABSOLUTE_RESPONSE_TOKEN_LIMIT) if requested else ABSOLUTE_RESPONSE_TOKEN_LIMIT
+    if context_length:
+        remaining = context_length - _estimate_prompt_tokens(messages) - CONTEXT_RESERVE_TOKENS
+        if remaining < limit:
+            limit = remaining
+    return max(1, limit)
+
+
 async def call_llama_server(
-    client: httpx.AsyncClient,
+    provider: ModelProvider,
     messages: List[dict],
     temperature: float,
     max_tokens: int,
     stream: bool,
 ) -> AsyncGenerator[dict, None]:
     """Call llama-server for chat completion."""
+    if provider.client is None:
+        raise RuntimeError("Chat runtime is not ready")
+
+    client = provider.client
+    headers = provider.authorization_headers
     payload = {
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": stream,
     }
-    
-    if not stream:
-        response = await client.post("/v1/chat/completions", json=payload)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
-        yield response.json()
-        return
 
-    async with client.stream("POST", "/v1/chat/completions", json=payload) as response:
-        if response.status_code != 200:
-            error_text = await response.aread()
-            raise HTTPException(status_code=response.status_code, detail=error_text.decode())
+    try:
+        if not stream:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+            yield response.json()
+            return
 
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        ) as response:
+            if response.status_code != 200:
+                error_text = await response.aread()
+                raise HTTPException(status_code=response.status_code, detail=error_text.decode())
+
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        yield json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+    except HTTPException:
+        raise
+    except httpx.TimeoutException as error:
+        # A local CPU model that cannot finish inside the request limit is an
+        # availability problem. Report it as such instead of an opaque 500.
+        logger.error("Local chat runtime exceeded its request limit (%s)", type(error).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The local chat model did not finish within the request time limit. "
+                "Shorten the question or the response length, choose a smaller model, "
+                "or raise NOC_AI_CHAT_GENERATION_TIMEOUT_SECONDS, then try again."
+            ),
+        ) from error
+    except httpx.HTTPError as error:
+        logger.error("Local chat runtime request failed (%s)", type(error).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The local chat model could not be reached. Open Diagnostics, "
+                "reload the chat model, and try again."
+            ),
+        ) from error
 
 @router.get("/conversations", response_model=List[ConversationResponse])
 async def list_conversations(
@@ -394,7 +461,7 @@ async def _chat_completion(request, http_request, current_user, db, model_manage
     # request so a saved policy takes effect without restarting the backend.
     history = [{"role": m.role, "content": m.content} for m in messages]
     temperature = request.temperature if request.temperature is not None else conversation.temperature / 100.0
-    max_tokens = request.maxTokens if request.maxTokens is not None else conversation.max_tokens
+    requested_max_tokens = request.maxTokens if request.maxTokens is not None else conversation.max_tokens
 
     effective_settings = load_effective_settings(db, current_user)
     behavior = effective_settings["behavior"]
@@ -548,6 +615,16 @@ async def _chat_completion(request, http_request, current_user, db, model_manage
     if not chat_provider:
         raise HTTPException(500, "Failed to load model")
 
+    # Resolve one bounded generation budget from the request, the conversation,
+    # the configured cap and the model context window.
+    max_tokens = _resolve_response_token_limit(
+        history,
+        conversation_limit=conversation.max_tokens,
+        request_limit=request.maxTokens,
+        context_length=getattr(model, "context_length", None)
+        or get_settings().default_context_length,
+    )
+
     # Strictly grounded answers are collected before they are exposed. This
     # lets the backend reject a model response that ignored the citation rule,
     # including when the caller requested an SSE response.
@@ -555,7 +632,7 @@ async def _chat_completion(request, http_request, current_user, db, model_manage
         full_content = ""
         usage = None
         async for chunk_data in call_llama_server(
-            client=chat_provider.client,
+            provider=chat_provider,
             messages=history,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -615,7 +692,7 @@ async def _chat_completion(request, http_request, current_user, db, model_manage
         completed = False
         try:
             async for chunk_data in call_llama_server(
-                client=chat_provider.client,
+                provider=chat_provider,
                 messages=history,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -677,7 +754,7 @@ async def _chat_completion(request, http_request, current_user, db, model_manage
         usage = None
         
         async for chunk_data in call_llama_server(
-            client=chat_provider.client,
+            provider=chat_provider,
             messages=history,
             temperature=temperature,
             max_tokens=max_tokens,

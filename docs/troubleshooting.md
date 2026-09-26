@@ -124,6 +124,33 @@ Get-Content "%LOCALAPPDATA%\NOC AI Assistant\logs\inference-*.log" -Tail 50
 - Check embedding model is active
 - Re-process documents if needed
 
+#### "Model did not finish within the request time limit"
+A fully offline model runs on this machine's CPU, so one grounded answer can take
+several minutes. The backend therefore always sends a bounded `max_tokens` value
+(never an unbounded request) and allows up to
+`NOC_AI_CHAT_GENERATION_TIMEOUT_SECONDS` (default `3600`) for one answer.
+
+The response limit is the smallest of the request value, the conversation value,
+the `2048`-token hard cap, and the room left in the model context window. An
+over-large request is clamped instead of failing.
+
+| Cause | Fix |
+|-------|-----|
+| Very large retrievable context per answer | Lower `maxSources` in Settings → Behavior |
+| Small context model with a long chat history | Start a new chat or reduce context length |
+| Large or heavily quantized model on CPU | Use a smaller GGUF chat model |
+| Machine genuinely needs longer | Raise `NOC_AI_CHAT_GENERATION_TIMEOUT_SECONDS` and restart the app |
+
+Retrieval itself is not the bottleneck: if Knowledge search returns scored hits
+for the same question, the failure is model latency, not missing knowledge.
+
+#### "Model runtime failed to start ... did not become healthy"
+
+A large GGUF can take a long time to load from disk on a busy CPU-only machine.
+The readiness budget is `NOC_AI_MODEL_LOAD_TIMEOUT_SECONDS` (default `180`).
+Check free memory and disk throughput, close other applications, then retry the
+activation from **Models**.
+
 ### 5. Document Ingestion Failures
 
 #### Stuck in "PARSING"
@@ -312,6 +339,52 @@ Change in **Settings → Diagnostics → Log Level**:
 - `ERROR` - Failures only
 
 ## Emergency Procedures
+
+### Locked Out: Reset the Database
+
+Use this when you forgot the administrator password, credentials stop working,
+or the database is corrupted. It deletes only `nocai.db` (plus its `-wal` and
+`-shm` companion files). Models, knowledge files, and settings are untouched.
+
+#### What the reset does
+1. Copies `nocai.db`, `nocai.db-wal`, and `nocai.db-shm` to
+   `%APPDATA%\NOC AI Assistant\backups\db-reset-<timestamp>\` together with a
+   SHA-256 `manifest.json`.
+2. Deletes the original database files (with rollback if a delete fails).
+3. On the next launch the first-run screen appears; the first login creates a
+   brand-new administrator account.
+
+#### Steps
+1. Close NOC AI Assistant completely.
+2. Run this from a repository checkout:
+
+```powershell
+pwsh -NoProfile -File .\scripts\reset-db.ps1
+```
+
+   - You must type `RESET` to confirm.
+   - Add `-Force` to stop running application processes automatically instead
+     of closing the app manually.
+   - Add `-Yes` to skip the prompt for non-interactive use.
+3. Start NOC AI Assistant and create the new administrator account.
+
+#### Undo a reset (restore a backup)
+
+```powershell
+pwsh -NoProfile -File .\scripts\reset-db.ps1 -RestoreFrom "$env:APPDATA\NOC AI Assistant\backups\db-reset-<timestamp>"
+```
+
+Type `RESTORE` to confirm (or pass `-Yes`). The database being replaced is
+backed up first, so a restore is reversible too. Backups are verified against
+their SHA-256 manifest before being restored.
+
+#### Notes
+- Conversations, accounts, and audit history live only in the database; after a
+  reset they exist solely in the backup until you restore it.
+- Backups live inside the profile directory and are removed by Complete Reset
+  below - copy them elsewhere for long-term retention.
+- Installed machines without a repository checkout can copy
+  `scripts\reset-db.ps1` from the source tree and run it the same way.
 
 ### Complete Reset
 ```powershell
